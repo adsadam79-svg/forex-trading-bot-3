@@ -1,0 +1,957 @@
+import os
+import json
+import time
+import requests
+import threading
+import base64
+from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TWELVE_DATA_API_KEY = os.environ["TWELVE_DATA_API_KEY"]
+GH_TOKEN = os.environ.get("GH_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
+PORT = int(os.environ.get("PORT", 8080))
+
+PAIRS = ["USD/JPY", "AUD/USD"]
+TIMEFRAMES = ["15min", "1h", "4h"]
+OPPORTUNITIES_FILE = "opportunities.json"
+
+PAIR_CURRENCIES = {
+    "USD/JPY": ["USD", "JPY"],
+    "AUD/USD": ["AUD", "USD"],
+}
+
+SWING_LOOKBACK = 3          # 3 شمعات يمين + 3 يسار
+PULLBACK_MAX_CANDLES = 6    # حد أقصى ديال الشموع لانتظار الـ Pullback
+BOS_MAX_CANDLES = 10        # حد أقصى ديال الشموع لانتظار BOS بعد Sweep
+SWEEP_ATR_MULTIPLIER = 0.15
+RECENT_CHECK_CANDLES = 3    # كنشيكو آخر 3 شموع (ماشي غير آخر وحدة) لـ Sweep/Candle confirmation
+PULLBACK_TOUCH_ATR = 0.3    # قرب كافي من BOS level باش نعتبروه "لمس" (touch)
+
+# حالة التريدات المنتظرة للتأكيد — dict بالـ pair كـ key
+pending_trades = {}        # {"USD/JPY": trade_dict, ...}
+waiting_confirmation = {}  # {"USD/JPY": True/False, ...}
+
+# state machine لكل pair+timeframe: كيتبع فين وصلنا فالتسلسل
+# {"USD/JPY_15min": {"stage": "waiting_sweep"/"waiting_bos"/"waiting_pullback"/"waiting_candle",
+#                     "direction": "BUY"/"SELL", "swing_level": float, "bos_level": float,
+#                     "candles_since_bos": int}}
+sequence_state = {}
+
+# Cache ديال البيانات باش ما نطلبوش أكثر من مرة
+data_cache = {}
+
+def fetch_all_data():
+    """كيجيب بيانات كل الأزواج مرة واحدة ويحفظها فالـ cache"""
+    global data_cache
+    data_cache = {}
+    for pair in PAIRS:
+        data_cache[pair] = {}
+        for tf in ["15min", "1h", "4h"]:
+            result = get_price_data(pair, tf)
+            data_cache[pair][tf] = result
+
+def get_cached_data(pair, interval):
+    """كيرجع البيانات من الـ cache"""
+    return data_cache.get(pair, {}).get(interval, None)
+
+def send_telegram(msg, reply_markup=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML"
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    requests.post(url, json=payload)
+
+def send_with_buttons(msg, trade):
+    pair_key = trade["pair"].replace("/", "")  # "USD/JPY" → "USDJPY"
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ نعم، دخلها!", "callback_data": f"yes_{pair_key}"},
+            {"text": "❌ لا، تجاوزها", "callback_data": f"no_{pair_key}"}
+        ]]
+    }
+    send_telegram(msg, reply_markup=keyboard)
+
+def answer_callback(callback_query_id):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+    requests.post(url, json={"callback_query_id": callback_query_id})
+
+def set_webhook():
+    # امسح الـ webhook القديم أولاً
+    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
+    time.sleep(2)
+    # سجل الجديد
+    webhook_url = "https://forex-trading-bot-2-production.up.railway.app/webhook"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+    r = requests.post(url, json={"url": webhook_url})
+    print(f"Webhook set: {r.json()}")
+
+def get_high_impact_news(pair):
+    try:
+        currencies = PAIR_CURRENCIES.get(pair, [])
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        r = requests.get(url, timeout=10)
+        events = r.json()
+        now = datetime.now(timezone.utc)
+        danger_events = []
+        warning_events = []
+        for event in events:
+            if event.get("impact") != "High":
+                continue
+            if event.get("currency") not in currencies:
+                continue
+            try:
+                event_time = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+            except:
+                continue
+            diff_minutes = (event_time - now).total_seconds() / 60
+            if -30 <= diff_minutes <= 120:
+                danger_events.append(event["title"])
+            elif 120 < diff_minutes <= 480:
+                warning_events.append(event["title"])
+        return danger_events, warning_events
+    except:
+        return [], []
+
+def get_market_summary(pair):
+    """كيجيب ملخص تحركات السوق ديال اليوم"""
+    try:
+        result_1h = get_cached_data(pair, "1h") or get_price_data(pair, "1h", 24)
+        result_15 = get_cached_data(pair, "15min") or get_price_data(pair, "15min", 8)
+        if not result_1h or not result_15:
+            return None
+
+        closes_1h = result_1h[0]
+        closes_15 = result_15[0]
+
+        # تحرك اليوم
+        open_price = closes_1h[0]
+        current = closes_1h[-1]
+        change = round(current - open_price, 6)
+        change_pct = round((change / open_price) * 100, 3)
+        direction_emoji = "📈" if change > 0 else "📉"
+
+        # أعلى وأدنى اليوم
+        highs_1h = result_1h[1]
+        lows_1h = result_1h[2]
+        high_day = round(max(highs_1h), 6)
+        low_day = round(min(lows_1h), 6)
+
+        # تحرك آخر ساعة
+        last_hour_change = round(closes_15[-1] - closes_15[0], 6)
+        last_hour_emoji = "⬆️" if last_hour_change > 0 else "⬇️"
+
+        return {
+            "change": change,
+            "change_pct": change_pct,
+            "direction_emoji": direction_emoji,
+            "high_day": high_day,
+            "low_day": low_day,
+            "last_hour_change": last_hour_change,
+            "last_hour_emoji": last_hour_emoji,
+            "current": current
+        }
+    except:
+        return None
+
+def get_news_summary(pair):
+    """كيجيب ملخص الأخبار ديال اليوم"""
+    try:
+        currencies = PAIR_CURRENCIES.get(pair, [])
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        r = requests.get(url, timeout=10)
+        events = r.json()
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        today_news = []
+        for event in events:
+            if event.get("impact") not in ["High", "Medium"]:
+                continue
+            if event.get("currency") not in currencies:
+                continue
+            try:
+                event_time = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+            except:
+                continue
+            if event_time.strftime("%Y-%m-%d") == today:
+                impact_emoji = "🔴" if event.get("impact") == "High" else "🟡"
+                diff = (event_time - now).total_seconds() / 60
+                if diff < -60:
+                    status = "مرات"
+                elif diff < 0:
+                    status = "داز دابا"
+                else:
+                    status = f"بعد {int(diff)} دقيقة"
+                today_news.append(f"{impact_emoji} {event['title']} ({status})")
+        return today_news
+    except:
+        return []
+
+price_cache = {}
+
+CACHE_SECONDS = {
+    "15min": 900,
+    "1h": 3600,
+    "4h": 14400
+}
+
+def get_price_data(pair, interval="15min", outputsize=250):
+    """كترجع (closes, highs, lows, opens) — زدنا opens باش نقدرو نحسبو Candlestick Confirmation"""
+    global price_cache
+
+    cache_key = f"{pair}_{interval}"
+    now_ts = time.time()
+
+    if cache_key in price_cache:
+        cached_time = price_cache[cache_key]["time"]
+
+        if now_ts - cached_time < CACHE_SECONDS.get(interval, 900):
+            return price_cache[cache_key]["data"]
+
+    params = {
+        "symbol": pair,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY
+    }
+
+    try:
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params=params,
+            timeout=15
+        )
+
+        data = r.json()
+
+        if "values" not in data:
+            print(
+                f"API Error {pair} {interval}: "
+                f"{data.get('message', data.get('code', 'unknown'))}"
+            )
+            return None
+
+        closes = [float(v["close"]) for v in reversed(data["values"])]
+        highs = [float(v["high"]) for v in reversed(data["values"])]
+        lows = [float(v["low"]) for v in reversed(data["values"])]
+        opens = [float(v["open"]) for v in reversed(data["values"])]
+
+        result = (closes, highs, lows, opens)
+
+        price_cache[cache_key] = {
+            "time": now_ts,
+            "data": result
+        }
+
+        return result
+
+    except Exception as e:
+        print(f"Price API Error {pair} {interval}: {e}")
+        return None
+
+def calc_atr(highs, lows, closes, period=14):
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    return round(sum(trs[-period:]) / period, 6)
+
+
+def get_swing_points(highs, lows):
+    """
+    Swing High/Low بـ 3 شمعات يمين + 3 يسار (SWING_LOOKBACK).
+    كترجع لائحة ديال (index, price, type) — type = "high" أو "low"
+    """
+    swings = []
+    n = len(highs)
+    for i in range(SWING_LOOKBACK, n - SWING_LOOKBACK):
+        window_highs = highs[i - SWING_LOOKBACK: i + SWING_LOOKBACK + 1]
+        window_lows = lows[i - SWING_LOOKBACK: i + SWING_LOOKBACK + 1]
+
+        if highs[i] == max(window_highs) and window_highs.count(highs[i]) == 1:
+            swings.append((i, highs[i], "high"))
+
+        if lows[i] == min(window_lows) and window_lows.count(lows[i]) == 1:
+            swings.append((i, lows[i], "low"))
+
+    return swings
+
+
+def get_last_swing(swings, swing_type, before_index=None):
+    """كيرجع آخر Swing High/Low قبل index معينة (أو آخر واحد فالمجموعة)"""
+    filtered = [s for s in swings if s[2] == swing_type]
+    if before_index is not None:
+        filtered = [s for s in filtered if s[0] < before_index]
+    if not filtered:
+        return None
+    return filtered[-1]  # آخر واحد (الأقرب للحاضر)
+
+
+def is_bullish_engulfing(opens, closes, i):
+    if i < 1:
+        return False
+    prev_open, prev_close = opens[i-1], closes[i-1]
+    curr_open, curr_close = opens[i], closes[i]
+    prev_bearish = prev_close < prev_open
+    curr_bullish = curr_close > curr_open
+    engulfs = curr_open <= prev_close and curr_close >= prev_open
+    return prev_bearish and curr_bullish and engulfs
+
+
+def is_bearish_engulfing(opens, closes, i):
+    if i < 1:
+        return False
+    prev_open, prev_close = opens[i-1], closes[i-1]
+    curr_open, curr_close = opens[i], closes[i]
+    prev_bullish = prev_close > prev_open
+    curr_bearish = curr_close < curr_open
+    engulfs = curr_open >= prev_close and curr_close <= prev_open
+    return prev_bullish and curr_bearish and engulfs
+
+
+def is_strong_bull_candle(opens, highs, lows, closes, i):
+    o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+    total_range = h - l
+    if total_range <= 0:
+        return False
+    body = c - o
+    return body > 0 and (body / total_range) > 0.70
+
+
+def is_strong_bear_candle(opens, highs, lows, closes, i):
+    o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+    total_range = h - l
+    if total_range <= 0:
+        return False
+    body = o - c
+    return body > 0 and (body / total_range) > 0.70
+
+
+def check_candlestick_confirmation(opens, highs, lows, closes, direction):
+    """
+    كيتشيك آخر RECENT_CHECK_CANDLES شموع (ماشي غير آخر وحدة) —
+    باش ما نضيعوش confirmation وقعات شي شمعة قبل هاد اللحظة.
+    كيرجع True إذا لقا confirmation فأي وحدة منهم.
+    """
+    n = len(closes)
+    start = max(1, n - RECENT_CHECK_CANDLES)
+    for i in range(start, n):
+        if direction == "BUY":
+            if is_bullish_engulfing(opens, closes, i) or is_strong_bull_candle(opens, highs, lows, closes, i):
+                return True
+        else:
+            if is_bearish_engulfing(opens, closes, i) or is_strong_bear_candle(opens, highs, lows, closes, i):
+                return True
+    return False
+
+
+def reset_state(state_key):
+    sequence_state[state_key] = {"stage": "waiting_sweep"}
+
+
+def check_recent_sweep(highs, lows, closes, swings, sweep_threshold):
+    """
+    كنشيكو آخر RECENT_CHECK_CANDLES شموع (ماشي غير آخر وحدة) على Liquidity Sweep،
+    باش ما نضيعوش Sweep وقع شمعة أو جوج قبل هاد اللحظة.
+    كيرجع (direction, swing_level) أو None
+    """
+    n = len(closes)
+    start = max(0, n - RECENT_CHECK_CANDLES)
+
+    for i in range(start, n):
+        last_swing_low = get_last_swing(swings, "low", before_index=i)
+        last_swing_high = get_last_swing(swings, "high", before_index=i)
+
+        if last_swing_low:
+            low_level = last_swing_low[1]
+            broke_below = lows[i] < (low_level - sweep_threshold)
+            closed_above = closes[i] > low_level
+            if broke_below and closed_above:
+                return "BUY", low_level
+
+        if last_swing_high:
+            high_level = last_swing_high[1]
+            broke_above = highs[i] > (high_level + sweep_threshold)
+            closed_below = closes[i] < high_level
+            if broke_above and closed_below:
+                return "SELL", high_level
+
+    return None
+
+
+def analyze_timeframe(pair, interval):
+    """
+    State machine: Liquidity Sweep → BOS → Pullback (touch + reject) → Candlestick Confirmation
+    كيرجع dict فيه direction فقط إذا التسلسل كامل بالكامل فهاد الـ iteration
+    """
+    result = get_cached_data(pair, interval) or get_price_data(pair, interval)
+    if not result:
+        return None
+
+    closes, highs, lows, opens = result
+    atr = calc_atr(highs, lows, closes)
+    if atr is None:
+        return None
+
+    swings = get_swing_points(highs, lows)
+    if not swings:
+        return None
+
+    state_key = f"{pair}_{interval}"
+    state = sequence_state.get(state_key, {"stage": "waiting_sweep"})
+
+    current_price = closes[-1]
+    current_high = highs[-1]
+    current_low = lows[-1]
+    current_close = closes[-1]
+
+    sweep_threshold = atr * SWEEP_ATR_MULTIPLIER
+
+    # ---------- المرحلة 1: البحث على Liquidity Sweep (آخر 3 شموع) ----------
+    if state["stage"] == "waiting_sweep":
+        sweep = check_recent_sweep(highs, lows, closes, swings, sweep_threshold)
+        if sweep:
+            direction, swing_level = sweep
+            sequence_state[state_key] = {
+                "stage": "waiting_bos",
+                "direction": direction,
+                "swing_level": swing_level,
+                "bos_level": None,
+                "candles_since_bos": 0,
+                "candles_since_sweep": 0,
+                "touched_bos": False,
+            }
+        return None
+
+    # ---------- المرحلة 2: البحث على BOS (بحد أقصى BOS_MAX_CANDLES) ----------
+    if state["stage"] == "waiting_bos":
+        direction = state["direction"]
+
+        if direction == "BUY":
+            last_swing_high = get_last_swing(swings, "high")
+            if last_swing_high and current_close > last_swing_high[1]:
+                state["stage"] = "waiting_pullback"
+                state["bos_level"] = last_swing_high[1]
+                state["candles_since_bos"] = 0
+                state["touched_bos"] = False
+                sequence_state[state_key] = state
+                return None
+        else:
+            last_swing_low = get_last_swing(swings, "low")
+            if last_swing_low and current_close < last_swing_low[1]:
+                state["stage"] = "waiting_pullback"
+                state["bos_level"] = last_swing_low[1]
+                state["candles_since_bos"] = 0
+                state["touched_bos"] = False
+                sequence_state[state_key] = state
+                return None
+
+        # BOS ماجاش، نزيدو العداد ونتشيكو timeout
+        state["candles_since_sweep"] = state.get("candles_since_sweep", 0) + 1
+        if state["candles_since_sweep"] > BOS_MAX_CANDLES:
+            reset_state(state_key)
+            return None
+
+        sequence_state[state_key] = state
+        return None
+
+    # ---------- المرحلة 3: انتظار Pullback (لمس BOS level من بعد رفض) ----------
+    if state["stage"] == "waiting_pullback":
+        direction = state["direction"]
+        bos_level = state["bos_level"]
+        touch_threshold = atr * PULLBACK_TOUCH_ATR
+
+        if direction == "BUY":
+            # كسر BOS بشكل واضح (close تحتو) → الإشارة تلغى بالكامل
+            if current_close < bos_level:
+                reset_state(state_key)
+                return None
+
+            # واش السعر لمس/اقترب من BOS level (retrace حقيقي)؟
+            if not state.get("touched_bos"):
+                if current_low <= bos_level + touch_threshold:
+                    state["touched_bos"] = True
+
+            # بعد ما لمس، خاصو "يرفض" ويبدا يبعد فالاتجاه الصحيح
+            if state.get("touched_bos") and current_close > bos_level + touch_threshold:
+                state["stage"] = "waiting_candle"
+                sequence_state[state_key] = state
+                return None
+
+        else:
+            if current_close > bos_level:
+                reset_state(state_key)
+                return None
+
+            if not state.get("touched_bos"):
+                if current_high >= bos_level - touch_threshold:
+                    state["touched_bos"] = True
+
+            if state.get("touched_bos") and current_close < bos_level - touch_threshold:
+                state["stage"] = "waiting_candle"
+                sequence_state[state_key] = state
+                return None
+
+        # عداد الشموع منذ BOS
+        state["candles_since_bos"] = state.get("candles_since_bos", 0) + 1
+        if state["candles_since_bos"] > PULLBACK_MAX_CANDLES:
+            # فات الوقت بلا Pullback واضح — نلغيو ونرجعو نبداو من الصفر
+            reset_state(state_key)
+            return None
+
+        sequence_state[state_key] = state
+        return None
+
+    # ---------- المرحلة 4: Candlestick Confirmation (آخر 3 شموع) ----------
+    if state["stage"] == "waiting_candle":
+        direction = state["direction"]
+        bos_level = state["bos_level"]
+
+        confirmed = check_candlestick_confirmation(opens, highs, lows, closes, direction)
+
+        if confirmed:
+            # التسلسل كامل — نرجعو الإشارة ونريسيتو الـ state باش يبدا يبحث من جديد
+            reset_state(state_key)
+            return {
+                "direction": direction,
+                "atr": atr,
+                "price": current_price,
+                "bos_level": bos_level,
+            }
+
+        # ماكاينش confirmation، نزيدو عداد وقت الانتظار (بحد أقصى منطقي كذلك)
+        state["candles_since_bos"] = state.get("candles_since_bos", 0) + 1
+        if state["candles_since_bos"] > PULLBACK_MAX_CANDLES + RECENT_CHECK_CANDLES:
+            reset_state(state_key)
+            return None
+
+        sequence_state[state_key] = state
+        return None
+
+    return None
+
+
+def reset_pair_states(pair):
+    """كيريسيتي الـ state machine ديال كل الـ timeframes لـ pair معينة — يستعمل عند news خطيرة"""
+    for tf in TIMEFRAMES:
+        reset_state(f"{pair}_{tf}")
+
+
+def analyze_pair(pair):
+    results = {}
+    for tf in TIMEFRAMES:
+        res = analyze_timeframe(pair, tf)
+        if res and res["direction"] is not None:
+            results[tf] = res
+
+    if len(results) < 2:
+        return None
+
+    directions = [r["direction"] for r in results.values()]
+    if directions.count("BUY") >= 2:
+        direction = "BUY 📈"
+    elif directions.count("SELL") >= 2:
+        direction = "SELL 📉"
+    else:
+        return None
+
+    confirmed_tfs = [tf for tf, r in results.items() if r["direction"] in direction]
+    main = list(results.values())[0]
+    price = main["price"]
+    atr = main["atr"]
+
+    is_jpy = pair.endswith("JPY") or pair.startswith("JPY")
+    min_tp = 1.80 if is_jpy else 0.00180
+    max_tp = 2.20 if is_jpy else 0.00220
+    tp_distance = min(atr * 1.5, max_tp)
+    sl_distance = tp_distance / 1.5
+    rr = round(tp_distance / sl_distance, 2)
+
+    if "BUY" in direction:
+        if is_jpy:
+            tp = round(price + tp_distance, 3)
+            sl = round(price - sl_distance, 3)
+        else:
+            tp = round(price + tp_distance, 5)
+            sl = round(price - sl_distance, 5)
+    else:
+        if is_jpy:
+            tp = round(price - tp_distance, 3)
+            sl = round(price + sl_distance, 3)
+        else:
+            tp = round(price - tp_distance, 5)
+            sl = round(price + sl_distance, 5)
+
+    return {
+        "pair": pair,
+        "direction": direction,
+        "price": price,
+        "tp": tp,
+        "sl": sl,
+        "rr": rr,
+        "strength": len(confirmed_tfs),
+        "confirmed_tfs": confirmed_tfs,
+        "details": results
+    }
+
+
+def get_strength_label(strength):
+    if strength == 3:
+        return "⭐⭐⭐ قوية جداً"
+    elif strength == 2:
+        return "⭐⭐ متوسطة"
+    return "⭐ ضعيفة"
+
+
+def pull_from_github():
+    if not GH_TOKEN or not GITHUB_REPO:
+        return []
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{OPPORTUNITIES_FILE}"
+    headers = {"Authorization": f"token {GH_TOKEN}"}
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        return []
+    content = base64.b64decode(r.json()["content"]).decode()
+    try:
+        return json.loads(content)
+    except:
+        return []
+
+def push_to_github(opportunities):
+    if not GH_TOKEN or not GITHUB_REPO:
+        return
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{OPPORTUNITIES_FILE}"
+    headers = {"Authorization": f"token {GH_TOKEN}"}
+    r = requests.get(url, headers=headers)
+    sha = r.json().get("sha", "") if r.status_code == 200 else ""
+    content = json.dumps(opportunities, ensure_ascii=False, indent=2)
+    encoded = base64.b64encode(content.encode()).decode()
+    payload = {"message": "update opportunities", "content": encoded, "sha": sha}
+    requests.put(url, headers=headers, json=payload)
+
+def monitor_trade(trade):
+    global waiting_confirmation, pending_trades
+    pair = trade["pair"]
+
+    for i in range(3):
+        time.sleep(600)  # كل 10 دقائق
+        if not waiting_confirmation.get(pair):
+            return
+
+        result = get_price_data(pair)
+        if not result:
+            continue
+        closes = result[0]
+        current_price = closes[-1]
+
+        if "BUY" in trade["direction"]:
+            progress = "📈 السوق ماشي فالاتجاه الصح" if current_price > trade["price"] else "⚠️ السوق راجع شوية"
+        else:
+            progress = "📈 السوق ماشي فالاتجاه الصح" if current_price < trade["price"] else "⚠️ السوق راجع شوية"
+
+        remaining = 20 - (i + 1) * 10
+        send_telegram(
+            f"🔄 <b>تحديث — {pair}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"{progress}\n"
+            f"💰 السعر دابا: <b>{current_price}</b>\n"
+            f"⏳ باقي: <b>{remaining} دقيقة</b>\n"
+            f"🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+        )
+
+    if waiting_confirmation.get(pair):
+        result = get_price_data(pair)
+        current_price = result[0][-1] if result else trade["price"]
+        send_telegram(
+            f"🎯 <b>وقت الدخول — {pair}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"الإشارة باقية قوية ✅\n"
+            f"💰 السعر دابا: <b>{current_price}</b>\n"
+            f"🎯 TP: <b>{trade['tp']}</b>\n"
+            f"🛑 SL: <b>{trade['sl']}</b>\n"
+            f"⚖️ R/R: <b>1:{trade['rr']}</b>\n\n"
+            f"واش واجد تدخل؟ 🚀\n"
+            f"🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+        )
+    waiting_confirmation[pair] = False
+    pending_trades.pop(pair, None)
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+    def do_POST(self):
+        global waiting_confirmation, pending_trades
+        content_length = int(self.headers['Content-Length'])
+        body = self.rfile.read(content_length)
+        self.send_response(200)
+        self.end_headers()
+
+        try:
+            update = json.loads(body)
+
+            if "callback_query" in update:
+                cb = update["callback_query"]
+                data = cb.get("data", "")
+                answer_callback(cb["id"])
+
+                if "_" in data:
+                    action, pair_key = data.split("_", 1)
+                    pair = next((p for p in pending_trades if p.replace("/", "") == pair_key), None)
+                else:
+                    action, pair = data, None
+
+                if action == "yes" and pair and pair in pending_trades:
+                    waiting_confirmation[pair] = True
+                    trade = pending_trades[pair].copy()
+                    send_telegram(
+                        f"✅ <b>واخا! غادي نراقب التريد 30 دقيقة</b>\n"
+                        f"━━━━━━━━━━━━━━━━\n"
+                        f"غادي نبعت ليك تحديث كل 10 دقائق 👀\n"
+                        f"🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                    )
+                    t = threading.Thread(target=monitor_trade, args=(trade,))
+                    t.daemon = True
+                    t.start()
+
+                elif action == "no" and pair:
+                    pending_trades.pop(pair, None)
+                    waiting_confirmation[pair] = False
+                    send_telegram("❌ واخا، تجاوزنا هاد التريد. غادي نكملو نراقبو السوق 👀")
+
+        except Exception as e:
+            print(f"Webhook error: {e}")
+
+    def log_message(self, format, *args):
+        pass
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', PORT), WebhookHandler)
+    print(f"Server running on port {PORT}")
+    server.serve_forever()
+
+
+def get_debug_report(pair):
+    """Debug report — كيبين فين وصل الـ state machine لكل timeframe"""
+    lines = [f"🔍 {pair}"]
+
+    for tf in TIMEFRAMES:
+        tf_label = {"15min": "15min", "1h": "1H", "4h": "4H"}.get(tf, tf)
+        lines.append(f"\n━━━━━━━━")
+        lines.append(tf_label)
+
+        state_key = f"{pair}_{tf}"
+        state = sequence_state.get(state_key, {"stage": "waiting_sweep"})
+        stage = state.get("stage", "waiting_sweep")
+
+        stage_labels = {
+            "waiting_sweep": "🔎 كنبحثو على Liquidity Sweep",
+            "waiting_bos": "✅ Sweep وقع — كنستناو BOS",
+            "waiting_pullback": "✅ BOS وقع — كنستناو Pullback",
+            "waiting_candle": "✅ Pullback وقع — كنستناو Candlestick Confirmation",
+        }
+        lines.append(stage_labels.get(stage, stage))
+
+        if stage != "waiting_sweep":
+            direction = state.get("direction", "?")
+            lines.append(f"الاتجاه: {direction}")
+
+        if stage == "waiting_bos":
+            swing_level = state.get("swing_level")
+            candles = state.get("candles_since_sweep", 0)
+            lines.append(f"Swing Level (Sweep): {swing_level}")
+            lines.append(f"شموع منذ Sweep: {candles}/{BOS_MAX_CANDLES}")
+
+        if stage == "waiting_pullback":
+            bos_level = state.get("bos_level")
+            touched = state.get("touched_bos", False)
+            candles = state.get("candles_since_bos", 0)
+            lines.append(f"BOS Level: {bos_level}")
+            lines.append(f"لمس BOS zone: {'✅' if touched else '❌ لسا ماوصلش'}")
+            lines.append(f"شموع منذ BOS: {candles}/{PULLBACK_MAX_CANDLES}")
+
+        if stage == "waiting_candle":
+            bos_level = state.get("bos_level")
+            candles = state.get("candles_since_bos", 0)
+            lines.append(f"BOS Level: {bos_level}")
+            lines.append(f"كنستناو شمعة تأكيد — محاولات: {candles}/{PULLBACK_MAX_CANDLES + RECENT_CHECK_CANDLES}")
+
+    return "\n".join(lines)
+
+
+def send_hourly_report(pairs_status):
+    """كيبعت تقرير ساعي — رسالة debug منفصلة لكل pair"""
+    for pair in pairs_status:
+        send_telegram(get_debug_report(pair))
+
+def main_loop():
+    global pending_trades, waiting_confirmation
+    time.sleep(5)
+    set_webhook()
+
+    opportunities = pull_from_github()
+    last_report_hour = -1
+    last_signal = {}
+    # last_signal[pair] = {"direction": "BUY", "bos_level": float}
+    # إشارة جديدة تتبعت فقط إذا تغير الاتجاه أو تبدل مستوى BOS (يعني Sweep+BOS جدد بالكامل)
+
+    while True:
+        now = datetime.now(timezone.utc)
+        now_str = now.strftime("%H:%M UTC")
+
+        try:
+            if now.hour == 21 and now.minute < 15:
+                today = now.strftime("%Y-%m-%d")
+                today_ops = [o for o in opportunities if o.get("date", "").startswith(today)]
+
+                if not today_ops:
+                    send_telegram(
+                        f"📊 <b>التقرير اليومي — {today}</b>\n"
+                        f"━━━━━━━━━━━━━━━━\n"
+                        f"ما كانت كاينة حتى فرصة اليوم\n"
+                        f"🕐 {now_str}"
+                    )
+                else:
+                    msg = f"📊 <b>التقرير اليومي — {today}</b>\n━━━━━━━━━━━━━━━━\n"
+                    msg += f"📈 عدد الفرص: <b>{len(today_ops)}</b>\n\n"
+                    for i, op in enumerate(today_ops, 1):
+                        status = "🚫 ملغاة (news)" if op.get("cancelled") else "✅ أُرسلت"
+                        msg += (
+                            f"<b>{i}. {op['pair']}</b> — {op['direction']}\n"
+                            f"   💰 {op['price']} | 🎯 {op['tp']} | 🛑 {op['sl']}\n"
+                            f"   ⏱ {op['time']} | {status}\n\n"
+                        )
+                    msg += "━━━━━━━━━━━━━━━━\n⚠️ هاد المعلومات للتعلم فقط"
+                    send_telegram(msg)
+
+                time.sleep(900)
+                continue
+
+            fetch_all_data()
+
+            # تقرير كل ساعة
+            if now.hour != last_report_hour and now.minute < 15 and not any(waiting_confirmation.values()):
+                last_report_hour = now.hour
+                pairs_status = {pair: {} for pair in PAIRS}
+                send_hourly_report(pairs_status)
+
+            for pair in PAIRS:
+                    if waiting_confirmation.get(pair):
+                        continue
+
+                    trade = analyze_pair(pair)
+                    current_direction = "BUY" if trade and "BUY" in trade["direction"] else ("SELL" if trade and "SELL" in trade["direction"] else None)
+
+                    if not current_direction:
+                        last_signal.pop(pair, None)
+                        continue
+
+                    first_tf_data = list(trade["details"].values())[0]
+                    current_bos_level = first_tf_data["bos_level"]
+
+                    prev = last_signal.get(pair)
+                    if prev is not None:
+                        same_direction = prev["direction"] == current_direction
+                        same_bos = prev["bos_level"] == current_bos_level
+                        if same_direction and same_bos:
+                            continue
+
+                    danger_news, warning_news = get_high_impact_news(pair)
+
+                    op = {
+                        "date": now.strftime("%Y-%m-%d %H:%M"),
+                        "time": now_str,
+                        "pair": pair,
+                        "direction": trade["direction"],
+                        "price": trade["price"],
+                        "tp": trade["tp"],
+                        "sl": trade["sl"],
+                        "rr": trade["rr"],
+                        "strength": trade["strength"],
+                        "cancelled": bool(danger_news)
+                    }
+                    opportunities.append(op)
+                    push_to_github(opportunities)
+
+                    if danger_news:
+                        reset_pair_states(pair)  # نريسيتيو الـ state machine كاملة — الإشارة ملغاة بسبب الأخبار
+                        last_signal.pop(pair, None)
+                        send_telegram(
+                            f"⚠️ <b>تحذير — {pair}</b>\n"
+                            f"━━━━━━━━━━━━━━━━\n"
+                            f"كانت كاينة إشارة {trade['direction']} ولكن تم إلغاؤها:\n\n"
+                            + "\n".join([f"🔴 {n}" for n in danger_news]) +
+                            f"\n\n⏳ استنى تعدي الأخبار\n🕐 {now_str}"
+                        )
+                        continue
+
+                    tfs_text = " + ".join(trade["confirmed_tfs"])
+                    strength_text = get_strength_label(trade["strength"])
+
+                    news_warning = ""
+                    if warning_news:
+                        news_warning = "\n⚠️ <b>أخبار قادمة:</b>\n" + "\n".join([f"🟡 {n}" for n in warning_news]) + "\n"
+
+                    market = get_market_summary(trade['pair'])
+                    today_news = get_news_summary(trade['pair'])
+
+                    market_section = ""
+                    if market:
+                        market_section = (
+                            f"\n📊 <b>السوق اليوم:</b>\n"
+                            f"  {market['direction_emoji']} التغيير: {market['change']:+.6f} ({market['change_pct']:+.3f}%)\n"
+                            f"  🔝 أعلى: {market['high_day']} | 🔻 أدنى: {market['low_day']}\n"
+                            f"  {market['last_hour_emoji']} آخر ساعة: {market['last_hour_change']:+.6f}\n"
+                        )
+
+                    news_section = ""
+                    if today_news:
+                        news_section = f"\n📰 <b>أخبار اليوم:</b>\n" + "\n".join([f"  {n}" for n in today_news]) + "\n"
+
+                    msg = (
+                        f"🔔 <b>فرصة تريد — {trade['pair']}</b>\n"
+                        f"━━━━━━━━━━━━━━━━\n"
+                        f"📊 الإشارة: <b>{trade['direction']}</b>\n"
+                        f"💪 القوة: <b>{strength_text}</b>\n"
+                        f"⏱ مؤكدة على: <b>{tfs_text}</b>\n"
+                        f"📐 السلسلة: Liquidity Sweep ✅ → BOS ✅ → Pullback ✅ → Candle ✅\n"
+                        f"{market_section}"
+                        f"{news_section}"
+                        f"\n💰 السعر الحالي: <b>{trade['price']}</b>\n"
+                        f"🎯 TP: <b>{trade['tp']}</b>\n"
+                        f"🛑 SL: <b>{trade['sl']}</b>\n"
+                        f"⚖️ R/R: <b>1:{trade['rr']}</b>\n\n"
+                        f"{news_warning}"
+                        f"━━━━━━━━━━━━━━━━\n"
+                        f"🕐 {now_str}\n\n"
+                        f"واش بغيتي تدخل هاد التريد؟"
+                    )
+
+                    pending_trades[pair] = trade
+                    last_signal[pair] = {
+                        "direction": current_direction,
+                        "bos_level": current_bos_level,
+                    }
+                    send_with_buttons(msg, trade)
+                    # ماكاينش break — كيكمل على باقي الأزواج
+
+        except Exception as e:
+            print(f"Error: {e}")
+
+        time.sleep(900)
+
+if __name__ == "__main__":
+    server_thread = threading.Thread(target=run_server)
+    server_thread.daemon = True
+    server_thread.start()
+    main_loop()
