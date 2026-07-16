@@ -578,7 +578,7 @@ def main_loop():
                     if waiting_confirmation.get(pair):
                         continue
 
-                                       trade = analyze_pair(pair)
+                    trade = analyze_pair(pair)
                     if not trade:
                         continue
                     
