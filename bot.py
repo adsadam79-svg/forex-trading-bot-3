@@ -295,321 +295,50 @@ def get_last_swing(swings, swing_type, before_index=None):
     return filtered[-1]  # آخر واحد (الأقرب للحاضر)
 
 
-def is_bullish_engulfing(opens, closes, i):
-    if i < 1:
-        return False
-    prev_open, prev_close = opens[i-1], closes[i-1]
-    curr_open, curr_close = opens[i], closes[i]
-    prev_bearish = prev_close < prev_open
-    curr_bullish = curr_close > curr_open
-    engulfs = curr_open <= prev_close and curr_close >= prev_open
-    return prev_bearish and curr_bullish and engulfs
-
-
-def is_bearish_engulfing(opens, closes, i):
-    if i < 1:
-        return False
-    prev_open, prev_close = opens[i-1], closes[i-1]
-    curr_open, curr_close = opens[i], closes[i]
-    prev_bullish = prev_close > prev_open
-    curr_bearish = curr_close < curr_open
-    engulfs = curr_open >= prev_close and curr_close <= prev_open
-    return prev_bullish and curr_bearish and engulfs
-
-
-def is_strong_bull_candle(opens, highs, lows, closes, i):
-    o, h, l, c = opens[i], highs[i], lows[i], closes[i]
-    total_range = h - l
-    if total_range <= 0:
-        return False
-    body = c - o
-    return body > 0 and (body / total_range) > 0.70
-
-
-def is_strong_bear_candle(opens, highs, lows, closes, i):
-    o, h, l, c = opens[i], highs[i], lows[i], closes[i]
-    total_range = h - l
-    if total_range <= 0:
-        return False
-    body = o - c
-    return body > 0 and (body / total_range) > 0.70
-
-
-def check_candlestick_confirmation(opens, highs, lows, closes, direction):
-    """
-    كيتشيك آخر RECENT_CHECK_CANDLES شموع (ماشي غير آخر وحدة) —
-    باش ما نضيعوش confirmation وقعات شي شمعة قبل هاد اللحظة.
-    كيرجع True إذا لقا confirmation فأي وحدة منهم.
-    """
+# --- EXPERT SMC LOGIC (NEW) ---
+def detect_smc_setup_expert(closes, highs, lows, opens):
     n = len(closes)
-    start = max(1, n - RECENT_CHECK_CANDLES)
-    for i in range(start, n):
-        if direction == "BUY":
-            if is_bullish_engulfing(opens, closes, i) or is_strong_bull_candle(opens, highs, lows, closes, i):
-                return True
-        else:
-            if is_bearish_engulfing(opens, closes, i) or is_strong_bear_candle(opens, highs, lows, closes, i):
-                return True
-    return False
+    if n < 20: return None, {}
+    last_high, last_low = max(highs[-15:-3]), min(lows[-15:-3])
+    curr_c, curr_h, curr_l = closes[-1], highs[-1], lows[-1]
+    setup, details = None, {"sweep": False, "bos": False, "fvg": False}
+    
+    if curr_l < last_low and curr_c > last_low: details["sweep"] = True
+    if details["sweep"] and curr_c > max(highs[-6:-1]):
+        details["bos"], setup = True, "BUY"
+    if setup == "BUY" and lows[-1] > highs[-3]: details["fvg"] = True
+    
+    if curr_h > last_high and curr_c < last_high: details["sweep"] = True
+    if details["sweep"] and curr_c < min(lows[-6:-1]):
+        details["bos"], setup = True, "SELL"
+    if setup == "SELL" and highs[-1] < lows[-3]: details["fvg"] = True
+    return setup, details
 
+def get_trend_expert(data):
+    if not data: return "NEUTRAL"
+    return "BUY" if data[0][-1] > data[0][-20] else ("SELL" if data[0][-1] < data[0][-20] else "NEUTRAL")
 
-def reset_state(state_key):
-    sequence_state[state_key] = {"stage": "waiting_sweep"}
-
-
-def check_recent_sweep(highs, lows, closes, swings, sweep_threshold):
-    """
-    كنشيكو آخر RECENT_CHECK_CANDLES شموع (ماشي غير آخر وحدة) على Liquidity Sweep،
-    باش ما نضيعوش Sweep وقع شمعة أو جوج قبل هاد اللحظة.
-    كيرجع (direction, swing_level) أو None
-    """
-    n = len(closes)
-    start = max(0, n - RECENT_CHECK_CANDLES)
-
-    for i in range(start, n):
-        last_swing_low = get_last_swing(swings, "low", before_index=i)
-        last_swing_high = get_last_swing(swings, "high", before_index=i)
-
-        if last_swing_low:
-            low_level = last_swing_low[1]
-            broke_below = lows[i] < (low_level - sweep_threshold)
-            closed_above = closes[i] > low_level
-            if broke_below and closed_above:
-                return "BUY", low_level
-
-        if last_swing_high:
-            high_level = last_swing_high[1]
-            broke_above = highs[i] > (high_level + sweep_threshold)
-            closed_below = closes[i] < high_level
-            if broke_above and closed_below:
-                return "SELL", high_level
-
-    return None
-
-
-def analyze_timeframe(pair, interval):
-    """
-    State machine: Liquidity Sweep → BOS → Pullback (touch + reject) → Candlestick Confirmation
-    كيرجع dict فيه direction فقط إذا التسلسل كامل بالكامل فهاد الـ iteration
-    """
-    result = get_cached_data(pair, interval) or get_price_data(pair, interval)
-    if not result:
-        return None
-
-    closes, highs, lows, opens = result
-    atr = calc_atr(highs, lows, closes)
-    if atr is None:
-        return None
-
-    swings = get_swing_points(highs, lows)
-    if not swings:
-        return None
-
-    state_key = f"{pair}_{interval}"
-    state = sequence_state.get(state_key, {"stage": "waiting_sweep"})
-
-    current_price = closes[-1]
-    current_high = highs[-1]
-    current_low = lows[-1]
-    current_close = closes[-1]
-
-    sweep_threshold = atr * SWEEP_ATR_MULTIPLIER
-
-    # ---------- المرحلة 1: البحث على Liquidity Sweep (آخر 3 شموع) ----------
-    if state["stage"] == "waiting_sweep":
-        sweep = check_recent_sweep(highs, lows, closes, swings, sweep_threshold)
-        if sweep:
-            direction, swing_level = sweep
-            sequence_state[state_key] = {
-                "stage": "waiting_bos",
-                "direction": direction,
-                "swing_level": swing_level,
-                "bos_level": None,
-                "candles_since_bos": 0,
-                "candles_since_sweep": 0,
-                "touched_bos": False,
-            }
-        return None
-
-    # ---------- المرحلة 2: البحث على BOS (بحد أقصى BOS_MAX_CANDLES) ----------
-    if state["stage"] == "waiting_bos":
-        direction = state["direction"]
-
-        if direction == "BUY":
-            last_swing_high = get_last_swing(swings, "high")
-            if last_swing_high and current_close > last_swing_high[1]:
-                state["stage"] = "waiting_pullback"
-                state["bos_level"] = last_swing_high[1]
-                state["candles_since_bos"] = 0
-                state["touched_bos"] = False
-                sequence_state[state_key] = state
-                return None
-        else:
-            last_swing_low = get_last_swing(swings, "low")
-            if last_swing_low and current_close < last_swing_low[1]:
-                state["stage"] = "waiting_pullback"
-                state["bos_level"] = last_swing_low[1]
-                state["candles_since_bos"] = 0
-                state["touched_bos"] = False
-                sequence_state[state_key] = state
-                return None
-
-        # BOS ماجاش، نزيدو العداد ونتشيكو timeout
-        state["candles_since_sweep"] = state.get("candles_since_sweep", 0) + 1
-        if state["candles_since_sweep"] > BOS_MAX_CANDLES:
-            reset_state(state_key)
-            return None
-
-        sequence_state[state_key] = state
-        return None
-
-    # ---------- المرحلة 3: انتظار Pullback (لمس BOS level من بعد رفض) ----------
-    if state["stage"] == "waiting_pullback":
-        direction = state["direction"]
-        bos_level = state["bos_level"]
-        touch_threshold = atr * PULLBACK_TOUCH_ATR
-
-        if direction == "BUY":
-            # كسر BOS بشكل واضح (close تحتو) → الإشارة تلغى بالكامل
-            if current_close < bos_level:
-                reset_state(state_key)
-                return None
-
-            # واش السعر لمس/اقترب من BOS level (retrace حقيقي)؟
-            if not state.get("touched_bos"):
-                if current_low <= bos_level + touch_threshold:
-                    state["touched_bos"] = True
-
-            # بعد ما لمس، خاصو "يرفض" ويبدا يبعد فالاتجاه الصحيح
-            if state.get("touched_bos") and current_close > bos_level + touch_threshold:
-                state["stage"] = "waiting_candle"
-                sequence_state[state_key] = state
-                return None
-
-        else:
-            if current_close > bos_level:
-                reset_state(state_key)
-                return None
-
-            if not state.get("touched_bos"):
-                if current_high >= bos_level - touch_threshold:
-                    state["touched_bos"] = True
-
-            if state.get("touched_bos") and current_close < bos_level - touch_threshold:
-                state["stage"] = "waiting_candle"
-                sequence_state[state_key] = state
-                return None
-
-        # عداد الشموع منذ BOS
-        state["candles_since_bos"] = state.get("candles_since_bos", 0) + 1
-        if state["candles_since_bos"] > PULLBACK_MAX_CANDLES:
-            # فات الوقت بلا Pullback واضح — نلغيو ونرجعو نبداو من الصفر
-            reset_state(state_key)
-            return None
-
-        sequence_state[state_key] = state
-        return None
-
-    # ---------- المرحلة 4: Candlestick Confirmation (آخر 3 شموع) ----------
-    if state["stage"] == "waiting_candle":
-        direction = state["direction"]
-        bos_level = state["bos_level"]
-
-        confirmed = check_candlestick_confirmation(opens, highs, lows, closes, direction)
-
-        if confirmed:
-            # التسلسل كامل — نرجعو الإشارة ونريسيتو الـ state باش يبدا يبحث من جديد
-            reset_state(state_key)
-            return {
-                "direction": direction,
-                "atr": atr,
-                "price": current_price,
-                "bos_level": bos_level,
-            }
-
-        # ماكاينش confirmation، نزيدو عداد وقت الانتظار (بحد أقصى منطقي كذلك)
-        state["candles_since_bos"] = state.get("candles_since_bos", 0) + 1
-        if state["candles_since_bos"] > PULLBACK_MAX_CANDLES + RECENT_CHECK_CANDLES:
-            reset_state(state_key)
-            return None
-
-        sequence_state[state_key] = state
-        return None
-
-    return None
-
-
-def reset_pair_states(pair):
-    """كيريسيتي الـ state machine ديال كل الـ timeframes لـ pair معينة — يستعمل عند news خطيرة"""
-    for tf in TIMEFRAMES:
-        reset_state(f"{pair}_{tf}")
-
+def is_killzone_expert():
+    now_h = datetime.now(timezone.utc).hour
+    return 7 <= now_h <= 17
 
 def analyze_pair(pair):
-    results = {}
-    for tf in TIMEFRAMES:
-        res = analyze_timeframe(pair, tf)
-        if res and res["direction"] is not None:
-            results[tf] = res
-
-    if len(results) < 2:
-        return None
-
-    directions = [r["direction"] for r in results.values()]
-    if directions.count("BUY") >= 2:
-        direction = "BUY 📈"
-    elif directions.count("SELL") >= 2:
-        direction = "SELL 📉"
-    else:
-        return None
-
-    confirmed_tfs = [tf for tf, r in results.items() if r["direction"] in direction]
-    main = list(results.values())[0]
-    price = main["price"]
-    atr = main["atr"]
-
-    is_jpy = pair.endswith("JPY") or pair.startswith("JPY")
-    min_tp = 1.80 if is_jpy else 0.00180
-    max_tp = 2.20 if is_jpy else 0.00220
-    tp_distance = min(atr * 1.5, max_tp)
-    sl_distance = tp_distance / 1.5
-    rr = round(tp_distance / sl_distance, 2)
-
-    if "BUY" in direction:
-        if is_jpy:
-            tp = round(price + tp_distance, 3)
-            sl = round(price - sl_distance, 3)
-        else:
-            tp = round(price + tp_distance, 5)
-            sl = round(price - sl_distance, 5)
-    else:
-        if is_jpy:
-            tp = round(price - tp_distance, 3)
-            sl = round(price + sl_distance, 3)
-        else:
-            tp = round(price - tp_distance, 5)
-            sl = round(price + sl_distance, 5)
-
-    return {
-        "pair": pair,
-        "direction": direction,
-        "price": price,
-        "tp": tp,
-        "sl": sl,
-        "rr": rr,
-        "strength": len(confirmed_tfs),
-        "confirmed_tfs": confirmed_tfs,
-        "details": results
-    }
-
-
-def get_strength_label(strength):
-    if strength == 3:
-        return "⭐⭐⭐ قوية جداً"
-    elif strength == 2:
-        return "⭐⭐ متوسطة"
-    return "⭐ ضعيفة"
-
+    d15, d1h, d4h = get_cached_data(pair, "15min"), get_cached_data(pair, "1h"), get_cached_data(pair, "4h")
+    if not d15 or not d1h or not d4h: return None
+    setup_15, details = detect_smc_setup_expert(d15[0], d15[1], d15[2], d15[3])
+    if not setup_15: return None
+    t1h, t4h = get_trend_expert(d1h), get_trend_expert(t4h)
+    
+    stars = "⭐⭐⭐ GOLD" if setup_15 == t1h == t4h else ("⭐⭐ SILVER" if setup_15 == t1h else "⭐ BRONZE")
+    price, is_jpy = d15[0][-1], pair.endswith("JPY")
+    tp_dist = min(abs((max(d15[1][-12:-1]) if setup_15=="BUY" else min(d15[2][-12:-1])) - price), 0.220 if is_jpy else 0.00220)
+    tp_dist = max(tp_dist, 0.050 if is_jpy else 0.00050)
+    sl_dist = tp_dist / 1.5
+    
+    tp = round(price + tp_dist if setup_15=="BUY" else price - tp_dist, 5 if not is_jpy else 3)
+    sl = round(price - sl_dist if setup_15=="BUY" else price + sl_dist, 5 if not is_jpy else 3)
+    return {"pair": pair, "direction": setup_15, "stars": stars, "price": price, "tp": tp, "sl": sl, 
+            "tp_pts": round(tp_dist*(100 if is_jpy else 100000)), "details": details, "kz": is_killzone_expert(), "t": {"1h": t1h, "4h": t4h}}
 
 def pull_from_github():
     if not GH_TOKEN or not GITHUB_REPO:
@@ -849,25 +578,17 @@ def main_loop():
                     if waiting_confirmation.get(pair):
                         continue
 
-                    trade = analyze_pair(pair)
-                    current_direction = "BUY" if trade and "BUY" in trade["direction"] else ("SELL" if trade and "SELL" in trade["direction"] else None)
-
-                    if not current_direction:
-                        last_signal.pop(pair, None)
+                                       trade = analyze_pair(pair)
+                    if not trade:
                         continue
-
-                    first_tf_data = list(trade["details"].values())[0]
-                    current_bos_level = first_tf_data["bos_level"]
-
-                    prev = last_signal.get(pair)
-                    if prev is not None:
-                        same_direction = prev["direction"] == current_direction
-                        same_bos = prev["bos_level"] == current_bos_level
-                        if same_direction and same_bos:
-                            continue
-
+                    
+                    signal_key = f"{pair}_{trade['direction']}_{now.hour}"
+                    if signal_key in last_signal:
+                        continue
+                    
                     danger_news, warning_news = get_high_impact_news(pair)
-
+                    
+                    # S-ajel l-fursa f l-list dyal GitHub (opportunities)
                     op = {
                         "date": now.strftime("%Y-%m-%d %H:%M"),
                         "time": now_str,
@@ -876,8 +597,31 @@ def main_loop():
                         "price": trade["price"],
                         "tp": trade["tp"],
                         "sl": trade["sl"],
-                        "rr": trade["rr"],
-                        "strength": trade["strength"],
+                        "rr": 1.5,
+                        "strength": trade["stars"],
+                        "cancelled": bool(danger_news)
+                    }
+                    opportunities.append(op)
+                    push_to_github(opportunities)
+
+                    if danger_news:
+                        continue
+                        
+                    kz_icon = "✅" if trade["kz"] else "⚠️"
+                    msg = (f"🔔 <b>فرصة — {trade['pair']}</b>\n"
+                           f"Strength: <b>{trade['stars']}</b>\n"
+                           f"Direction: <b>{trade['direction']}</b>\n"
+                           f"Killzone: {kz_icon}\n"
+                           f"Confirmations: Sweep {'✅' if trade['details']['sweep'] else '❌'} | BOS {'✅' if trade['details']['bos'] else '❌'} | FVG {'✅' if trade['details']['fvg'] else '❌'}\n"
+                           f"💰 Entry: <b>{trade['price']}</b>\n"
+                           f"🎯 TP: <b>{trade['tp']}</b> ({trade['tp_pts']} pts)\n"
+                           f"🛑 SL: <b>{trade['sl']}</b>\n"
+                           f"Trends: 1H {trade['t']['1h']} | 4H {trade['t']['4h']}")
+                    
+                    pending_trades[pair] = trade
+                    last_signal[signal_key] = True
+                    send_with_buttons(msg, trade)
+
                         "cancelled": bool(danger_news)
                     }
                     opportunities.append(op)
