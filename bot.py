@@ -622,11 +622,6 @@ def main_loop():
                     last_signal[signal_key] = True
                     send_with_buttons(msg, trade)
 
-                        "cancelled": bool(danger_news)
-                    }
-                    opportunities.append(op)
-                    push_to_github(opportunities)
-
                     if danger_news:
                         reset_pair_states(pair)  # نريسيتيو الـ state machine كاملة — الإشارة ملغاة بسبب الأخبار
                         last_signal.pop(pair, None)
