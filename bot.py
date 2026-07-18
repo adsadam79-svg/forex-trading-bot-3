@@ -436,7 +436,7 @@ def analyze_timeframe(pair, interval):
                 bos_level = last_swing_high[1]
         else:
             last_swing_low = get_last_swing(swings, "low")
-            if last_swing_low& and current_close < last_swing_low[1]:
+            if last_swing_low and current_close < last_swing_low[1]:
                 bos_found = True
                 bos_level = last_swing_low[1]
 
