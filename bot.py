@@ -705,7 +705,7 @@ def monitor_trade(trade):
 
         remaining = 20 - (i + 1) * 10
         send_telegram(
-            f"🔄 <b>تحديث — {pair}</b>\n"
+            f"🔄 <b>تحديث — {trade['pair']}</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"{progress}\n"
             f"💰 السعر دابا: <b>{current_price}</b>\n"
@@ -969,21 +969,24 @@ def send_hourly_report(pairs_status):
         send_telegram(get_debug_report(pair))
 
 def main_loop():
-    global pending_trades, waiting_confirmation
+    global pending_trades, waiting_confirmation, last_report_hour
     time.sleep(5)
     set_webhook()
 
     opportunities = pull_from_github()
     last_report_hour = -1
+    last_daily_report_date = None  # تتبع تقرير اليومي لمنع الضياع بسبب التوقيت (Drift)
     last_signal = {}
 
     while True:
         now = datetime.now(timezone.utc)
         now_str = now.strftime("%H:%M UTC")
+        today = now.strftime("%Y-%m-%d")
 
         try:
-            if now.hour == 21 and now.minute < 15:
-                today = now.strftime("%Y-%m-%d")
+            # التقرير اليومي: مصلح ومحمي ضد زحف الدقائق (Drift) ليرسل بالضبط مرة واحدة فاليوم بعد الـ 21:00
+            if now.hour >= 21 and last_daily_report_date != today:
+                last_daily_report_date = today
                 today_ops = [o for o in opportunities if o.get("date", "").startswith(today)]
 
                 if not today_ops:
@@ -1011,8 +1014,8 @@ def main_loop():
 
             fetch_all_data()
 
-            # تقرير كل ساعة
-            if now.hour != last_report_hour and now.minute < 15 and not any(waiting_confirmation.values()):
+            # تقرير كل ساعة دقيق ومحمي ضد زحف الدقائق (Drift)
+            if now.hour != last_report_hour and not any(waiting_confirmation.values()):
                 last_report_hour = now.hour
                 pairs_status = {pair: {} for pair in PAIRS}
                 send_hourly_report(pairs_status)
