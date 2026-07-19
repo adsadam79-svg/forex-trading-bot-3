@@ -974,8 +974,15 @@ def main_loop():
     set_webhook()
 
     opportunities = pull_from_github()
+    
+    # استرداد الذاكرة من ملفopportunities.json فـ جيت هاب لضمان عدم ضياع التقرير اليومي عند الـ Restart
+    last_daily_report_date = None
+    if opportunities:
+        for op in opportunities:
+            if op.get("type") == "daily_report_sent":
+                last_daily_report_date = op.get("date")
+
     last_report_hour = -1
-    last_daily_report_date = None  # تتبع تقرير اليومي لمنع الضياع بسبب التوقيت (Drift)
     last_signal = {}
 
     while True:
@@ -984,10 +991,12 @@ def main_loop():
         today = now.strftime("%Y-%m-%d")
 
         try:
-            # التقرير اليومي: مصلح ومحمي ضد زحف الدقائق (Drift) ليرسل بالضبط مرة واحدة فاليوم بعد الـ 21:00
+            # التقرير اليومي محمي 100% ضد الـ Restart ومحمي ضد الـ Drift
             if now.hour >= 21 and last_daily_report_date != today:
                 last_daily_report_date = today
-                today_ops = [o for o in opportunities if o.get("date", "").startswith(today)]
+                
+                # تصفية صفقات اليوم لتجاهل الأسطر الخاصة بحالة الـ Metadata
+                today_ops = [o for o in opportunities if o.get("date", "").startswith(today) and o.get("type") != "daily_report_sent"]
 
                 if not today_ops:
                     send_telegram(
@@ -1009,6 +1018,13 @@ def main_loop():
                     msg += "━━━━━━━━━━━━━━━━\n⚠️ هاد المعلومات للتعلم فقط"
                     send_telegram(msg)
 
+                # حفظ حالة إرسال التقرير اليومي بشكل دائم على الـ GitHub
+                opportunities.append({
+                    "date": today,
+                    "type": "daily_report_sent"
+                })
+                push_to_github(opportunities)
+                
                 time.sleep(900)
                 continue
 
