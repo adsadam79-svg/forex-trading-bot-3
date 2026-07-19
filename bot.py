@@ -788,9 +788,9 @@ def run_server():
 
 def get_debug_report(pair):
     """تقرير المراقبة المطور (SMC Hybrid) - يعرض تفاصيل الـ SMC والاتجاه بدقة عالية"""
-    result_15 = get_cached_data(pair, "15min")
-    result_1h = get_cached_data(pair, "1h")
-    result_4h = get_cached_data(pair, "4h")
+    result_15 = get_cached_data(pair, "15min") or get_price_data(pair, "15min")
+    result_1h = get_cached_data(pair, "1h") or get_price_data(pair, "1h")
+    result_4h = get_cached_data(pair, "4h") or get_price_data(pair, "4h")
 
     if not result_15:
         return f"🔍 {pair} - Market Status Report\n━━━━━━━━━━━━━━━━\n⚠️ فريم 15min خالي من البيانات حالياً."
