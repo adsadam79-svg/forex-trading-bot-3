@@ -705,7 +705,7 @@ def monitor_trade(trade):
 
         remaining = 20 - (i + 1) * 10
         send_telegram(
-            f"🔄 <b>تحديث — {trade['pair']}</b>\n"
+            f"🔄 <b>تحديث — {pair}</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"{progress}\n"
             f"💰 السعر دابا: <b>{current_price}</b>\n"
@@ -787,180 +787,52 @@ def run_server():
     server.serve_forever()
 
 def get_debug_report(pair):
-    """تقرير المراقبة المطور (SMC Hybrid) - يعرض تفاصيل الـ SMC والاتجاه بدقة عالية"""
-    result_15 = get_cached_data(pair, "15min") or get_price_data(pair, "15min")
-    result_1h = get_cached_data(pair, "1h") or get_price_data(pair, "1h")
-    result_4h = get_cached_data(pair, "4h") or get_price_data(pair, "4h")
+    """تقرير المراقبة وتحديث مراحل الـ State Machine"""
+    lines = [f"🔍 {pair}"]
 
-    if not result_15:
-        return f"🔍 {pair} - Market Status Report\n━━━━━━━━━━━━━━━━\n⚠️ فريم 15min خالي من البيانات حالياً."
+    for tf in TIMEFRAMES:
+        tf_label = {"15min": "15min", "1h": "1H", "4h": "4H"}.get(tf, tf)
+        lines.append(f"\n━━━━━━━━")
+        lines.append(tf_label)
 
-    closes, highs, lows, opens = result_15
-    current_price = closes[-1]
+        state_key = f"{pair}_{tf}"
+        state = sequence_state.get(state_key, {"stage": "waiting_sweep"})
+        stage = state.get("stage", "waiting_sweep")
 
-    lines = [f"🔍 {pair} - Market Status Report", "━━━━━━━━━━━━━━━━"]
-
-    # ==================== 15min (SMC Logic) ====================
-    lines.append("15min (SMC Logic)")
-    state_key = f"{pair}_15min"
-    state = sequence_state.get(state_key, {"stage": "waiting_sweep"})
-    stage = state.get("stage", "waiting_sweep")
-    direction = state.get("direction", None)
-
-    # دالة مساعدة لإنشاء Checklist لكل اتجاه
-    def build_smc_checklist(for_dir):
-        if stage != "waiting_sweep" and direction == for_dir:
-            # Sweep
-            sw_level = state.get("swing_level", 0.0)
-            c_sweep = f"✅ Sweep: Found ({sw_level})"
-            s_sweep = 1
-
-            # BOS
-            if stage in ["waiting_pullback", "waiting_candle"]:
-                c_bos = "✅ BOS: Confirmed"
-                s_bos = 1
-                ob_l = state.get("ob_low", 0.0)
-                ob_h = state.get("ob_high", 0.0)
-                c_ob = f"✅ OB/FVG: Formed (OB: {ob_l} - {ob_h})"
-                s_ob = 1
-            else:
-                c_bos = "⏳ BOS: Waiting"
-                s_bos = 0
-                c_ob = "❌ OB/FVG: Not formed"
-                s_ob = 0
-
-            # Pullback
-            touched = state.get("touched_bos", False)
-            if stage == "waiting_candle":
-                c_pb = "✅ Pullback: Touched"
-                s_pb = 1
-            elif stage == "waiting_pullback":
-                c_pb = "✅ Pullback: Touched" if touched else "⏳ Pullback: Waiting"
-                s_pb = 1 if touched else 0
-            else:
-                c_pb = "❌ Pullback: Waiting"
-                s_pb = 0
-
-            # Candle
-            c_candle = "⏳ Candle Conf: Waiting" if stage == "waiting_candle" else "❌ Candle Conf: Waiting"
-            s_candle = 0
-
-            score = s_sweep + s_bos + s_ob + s_pb + s_candle
-        else:
-            c_sweep = "❌ Sweep: Not found"
-            c_bos = "⏳ BOS: Waiting" if stage == "waiting_sweep" else "❌ BOS: Waiting"
-            c_ob = "❌ OB/FVG: Not formed"
-            c_pb = "❌ Pullback: Waiting"
-            c_candle = "❌ Candle Conf: Waiting"
-            score = 0
-
-        return [
-            f"{c_sweep}",
-            f"{c_bos}",
-            f"{c_ob}",
-            f"{c_pb}",
-            f"{c_candle}",
-            f"Score: {score}/5"
-        ]
-
-    lines.append("BUY")
-    lines.extend(build_smc_checklist("BUY"))
-    lines.append("")
-    lines.append("SELL")
-    lines.extend(build_smc_checklist("SELL"))
-    lines.append("━━━━━━━━━━━━━━━━")
-
-    # ==================== 1H (Trend Context) ====================
-    lines.append("1H (Trend Context)")
-    if result_1h:
-        closes_1h, _, _, _ = result_1h
-        ema_1h = calc_ema(closes_1h, 200)
-        trend_1h = get_trend_structure(closes_1h)
-        price_1h = closes_1h[-1]
-
-        # BUY 1H
-        b_ema = price_1h > ema_1h if ema_1h else False
-        b_trend = trend_1h == "UP"
-        b_score = (2 if b_ema and b_trend else (1 if b_ema or b_trend else 0))
-        lines.append("BUY")
-        lines.append(f"{'✅' if b_ema else '❌'} EMA200: Price ({price_1h}) > EMA ({round(ema_1h, 5) if ema_1h else 0})")
-        lines.append(f"{'✅' if b_trend else '❌'} Trend Structure: {trend_1h} ({'Higher Highs' if b_trend else 'Bearish/Sideways ❌'})")
-        lines.append(f"Score: {b_score}/2")
-
-        # SELL 1H
-        s_ema = price_1h < ema_1h if ema_1h else False
-        s_trend = trend_1h == "DOWN"
-        s_score = (2 if s_ema and s_trend else (1 if s_ema or s_trend else 0))
-        lines.append("")
-        lines.append("SELL")
-        lines.append(f"{'✅' if s_ema else '❌'} EMA200: Price < EMA ({'Bearish ✅' if s_ema else 'Bullish ❌'})")
-        lines.append(f"{'✅' if s_trend else '❌'} Trend Structure: {trend_1h} ({'Lower Highs' if s_trend else 'Bullish/Sideways ❌'})")
-        lines.append(f"Score: {s_score}/2")
-    else:
-        lines.append("⚠️ فريم 1H خالي من البيانات حالياً.")
-    lines.append("━━━━━━━━━━━━━━━━")
-
-    # ==================== 4H (Major Trend) ====================
-    lines.append("4H (Major Trend)")
-    if result_4h:
-        closes_4h, _, _, _ = result_4h
-        ema_4h = calc_ema(closes_4h, 200)
-        trend_4h = get_trend_structure(closes_4h)
-        price_4h = closes_4h[-1]
-
-        # BUY 4H
-        b_ema = price_4h > ema_4h if ema_4h else False
-        b_trend = trend_4h == "UP"
-        b_score = (2 if b_ema and b_trend else (1 if b_ema or b_trend else 0))
-        lines.append("BUY")
-        lines.append(f"{'✅' if b_ema else '❌'} EMA200: Price > EMA200")
-        lines.append(f"{'✅' if b_trend else '❌'} Trend Structure: {trend_4h}")
-        lines.append(f"Score: {b_score}/2")
-
-        # SELL 4H
-        s_ema = price_4h < ema_4h if ema_4h else False
-        s_trend = trend_4h == "DOWN"
-        s_score = (2 if s_ema and s_trend else (1 if s_ema or s_trend else 0))
-        lines.append("")
-        lines.append("SELL")
-        lines.append(f"{'✅' if s_ema else '❌'} EMA200: Price < EMA200")
-        lines.append(f"{'✅' if s_trend else '❌'} Trend Structure: {trend_4h}")
-        lines.append(f"Score: {s_score}/2")
-    else:
-        lines.append("⚠️ فريم 4H خالي من البيانات حالياً.")
-    lines.append("━━━━━━━━━━━━━━━━")
-
-    # ==================== Overall Status ====================
-    status_label = "⏳ Waiting for 15min Sweep"
-    strength_label = "⭐ Bronze (No Setup)"
-    
-    if stage != "waiting_sweep" and direction:
-        status_labels = {
-            "waiting_bos": f"⏳ Waiting for BOS ({direction})",
-            "waiting_pullback": f"⏳ Waiting for Pullback ({direction})",
-            "waiting_candle": f"⏳ Waiting for 15min Confirmation ({direction})"
+        stage_labels = {
+            "waiting_sweep": "🔎 كنبحثو على Liquidity Sweep",
+            "waiting_bos": "✅ Sweep وقع — كنستناو BOS",
+            "waiting_pullback": "✅ BOS وقع — كنستناو Pullback (OB/FVG)",
+            "waiting_candle": "✅ Pullback وقع — كنستناو Candlestick Confirmation",
         }
-        status_label = status_labels.get(stage, "⏳ Waiting for 15min Confirmation")
+        lines.append(stage_labels.get(stage, stage))
 
-        # Stars Rating
-        h1_bias = get_timeframe_bias(pair, "1h")
-        h4_bias = get_timeframe_bias(pair, "4h")
-        confirmed_count = 1
-        if h1_bias == direction:
-            confirmed_count += 1
-        if h4_bias == direction:
-            confirmed_count += 1
+        if stage != "waiting_sweep":
+            direction = state.get("direction", "?")
+            lines.append(f"الاتجاه المتوقع: {direction}")
 
-        if confirmed_count == 3:
-            strength_label = "⭐⭐⭐ Gold (4H + 1H + 15m Alignment OK)"
-        elif confirmed_count == 2:
-            strength_label = "⭐⭐ Silver (1H + 15m Alignment OK)"
-        else:
-            strength_label = "⭐ Bronze (15m only)"
+        if stage == "waiting_bos":
+            swing_level = state.get("swing_level")
+            candles = state.get("candles_since_sweep", 0)
+            lines.append(f"Swing Level (Swept): {swing_level}")
+            lines.append(f"شموع منذ Sweep: {candles}/{BOS_MAX_CANDLES}")
 
-    lines.append(f"Overall Status: {status_label}")
-    lines.append(f"Strength: {strength_label}")
-    lines.append(f"Price: {current_price} | Killzone: {'✅ Active' if is_killzone() else '❌ Inactive'}")
+        if stage == "waiting_pullback":
+            bos_level = state.get("bos_level")
+            ob_low = state.get("ob_low")
+            ob_high = state.get("ob_high")
+            touched = state.get("touched_bos", False)
+            candles = state.get("candles_since_bos", 0)
+            lines.append(f"BOS Level: {bos_level}")
+            lines.append(f"Order Block Range: {ob_low} - {ob_high}")
+            lines.append(f"لمس مناطق السيولة (OB/FVG): {'✅' if touched else '❌ لم يلمسها بعد'}")
+            lines.append(f"شموع منذ BOS: {candles}/{PULLBACK_MAX_CANDLES}")
+
+        if stage == "waiting_candle":
+            bos_level = state.get("bos_level")
+            candles = state.get("candles_since_bos", 0)
+            lines.append(f"BOS Level: {bos_level}")
+            lines.append(f"انتظار شمعة تأكيد — محاولات: {candles}/{PULLBACK_MAX_CANDLES + RECENT_CHECK_CANDLES}")
 
     return "\n".join(lines)
 
@@ -969,34 +841,22 @@ def send_hourly_report(pairs_status):
         send_telegram(get_debug_report(pair))
 
 def main_loop():
-    global pending_trades, waiting_confirmation, last_report_hour
+    global pending_trades, waiting_confirmation
     time.sleep(5)
     set_webhook()
 
     opportunities = pull_from_github()
-    
-    # استرداد الذاكرة من ملفopportunities.json فـ جيت هاب لضمان عدم ضياع التقرير اليومي عند الـ Restart
-    last_daily_report_date = None
-    if opportunities:
-        for op in opportunities:
-            if op.get("type") == "daily_report_sent":
-                last_daily_report_date = op.get("date")
-
     last_report_hour = -1
     last_signal = {}
 
     while True:
         now = datetime.now(timezone.utc)
         now_str = now.strftime("%H:%M UTC")
-        today = now.strftime("%Y-%m-%d")
 
         try:
-            # التقرير اليومي محمي 100% ضد الـ Restart ومحمي ضد الـ Drift
-            if now.hour >= 21 and last_daily_report_date != today:
-                last_daily_report_date = today
-                
-                # تصفية صفقات اليوم لتجاهل الأسطر الخاصة بحالة الـ Metadata
-                today_ops = [o for o in opportunities if o.get("date", "").startswith(today) and o.get("type") != "daily_report_sent"]
+            if now.hour == 21 and now.minute < 15:
+                today = now.strftime("%Y-%m-%d")
+                today_ops = [o for o in opportunities if o.get("date", "").startswith(today)]
 
                 if not today_ops:
                     send_telegram(
@@ -1018,20 +878,13 @@ def main_loop():
                     msg += "━━━━━━━━━━━━━━━━\n⚠️ هاد المعلومات للتعلم فقط"
                     send_telegram(msg)
 
-                # حفظ حالة إرسال التقرير اليومي بشكل دائم على الـ GitHub
-                opportunities.append({
-                    "date": today,
-                    "type": "daily_report_sent"
-                })
-                push_to_github(opportunities)
-                
                 time.sleep(900)
                 continue
 
             fetch_all_data()
 
-            # تقرير كل ساعة دقيق ومحمي ضد زحف الدقائق (Drift)
-            if now.hour != last_report_hour and not any(waiting_confirmation.values()):
+            # تقرير كل ساعة
+            if now.hour != last_report_hour and now.minute < 15 and not any(waiting_confirmation.values()):
                 last_report_hour = now.hour
                 pairs_status = {pair: {} for pair in PAIRS}
                 send_hourly_report(pairs_status)
@@ -1049,7 +902,7 @@ def main_loop():
                     last_signal.pop(pair, None)
                     continue
 
-                # تصفية الدخول الفعلي: يتم فقط أثناء جلسات السيولة العالية
+                # تصفية الدخول الفعلي وإرسال التنبيهات: يتم فقط أثناء جلسات السيولة العالية
                 if not is_killzone():
                     print(f"⏳ {pair}: فرصة جاهزة ومكتملة الشروط، ولكن تم تأجيلها لعدم دخول الـ Killzone بعد.")
                     continue
