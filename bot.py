@@ -705,7 +705,7 @@ def monitor_trade(trade):
 
         remaining = 20 - (i + 1) * 10
         send_telegram(
-            f"🔄 <b>تحديث — {pair}</b>\n"
+            f"🔄 <b>تحديث — {trade['pair']}</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"{progress}\n"
             f"💰 السعر دابا: <b>{current_price}</b>\n"
