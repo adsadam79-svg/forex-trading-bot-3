@@ -788,82 +788,299 @@ def run_server():
     server.serve_forever()
 
 def get_debug_report(pair):
-    """تقرير المراقبة وتحديث مراحل الـ State Machine"""
+    """Read-only SMC diagnostic report. No trading logic or state changes."""
+
     lines = [f"🔍 {pair}"]
 
-    for tf in TIMEFRAMES:
-        tf_label = {"15min": "15min", "1h": "1H", "4h": "4H"}.get(tf, tf)
-        lines.append(f"\n━━━━━━━━")
-        lines.append(tf_label)
+    # =========================
+    # 15m SMC LOGIC
+    # =========================
+    result_15 = get_cached_data(pair, "15min") or get_price_data(pair, "15min")
 
-        state_key = f"{pair}_{tf}"
-        state = sequence_state.get(state_key, {"stage": "waiting_sweep"})
-        stage = state.get("stage", "waiting_sweep")
+    lines.append("\n━━━━━━━━━━━━━━━━")
+    lines.append("15min (SMC Logic)")
+    lines.append("━━━━━━━━━━━━━━━━")
 
-        if stage == "waiting_sweep":
-            lines.append("❌ Liquidity Sweep : Not Found")
+    if not result_15:
+        lines.append("❌ No market data")
+    else:
+        closes, highs, lows, opens = result_15
+        atr = calc_atr(highs, lows, closes)
 
-        elif stage == "waiting_bos":
-            direction = state.get("direction", "?")
-            swing_level = state.get("swing_level", 0.0)
-            candles_since_sweep = state.get("candles_since_sweep", 0)
+        if atr is None:
+            lines.append("❌ ATR not available")
+        else:
+            swings = get_swing_points(highs, lows)
+            sweep_threshold = atr * SWEEP_ATR_MULTIPLIER
 
-            lines.append(f"{direction}\n")
-            lines.append("✅ Liquidity Sweep : Found")
-            lines.append(f"Level : {swing_level}\n")
-            lines.append("⏳ BOS : Waiting")
-            lines.append(f"Candles : {candles_since_sweep} / {BOS_MAX_CANDLES}")
+            state_key = f"{pair}_15min"
+            state = sequence_state.get(
+                state_key,
+                {"stage": "waiting_sweep"}
+            )
 
-        elif stage == "waiting_pullback":
-            direction = state.get("direction", "?")
-            swing_level = state.get("swing_level", 0.0)
-            bos_level = state.get("bos_level", 0.0)
-            ob_low = state.get("ob_low", 0.0)
-            ob_high = state.get("ob_high", 0.0)
-            fvg_low = state.get("fvg_low", 0.0)
-            fvg_high = state.get("fvg_high", 0.0)
-            touched_bos = state.get("touched_bos", False)
-            candles_since_bos = state.get("candles_since_bos", 0)
+            stage = state.get("stage", "waiting_sweep")
+            direction = state.get("direction")
 
-            lines.append(f"{direction}\n")
-            lines.append("✅ Liquidity Sweep : Found")
-            lines.append(f"Level : {swing_level}\n")
-            lines.append("✅ BOS : Found")
-            lines.append(f"Level : {bos_level}\n")
-            lines.append("✅ Order Block")
-            lines.append(f"Low : {ob_low}")
-            lines.append(f"High : {ob_high}\n")
-            lines.append("✅ Fair Value Gap")
-            lines.append(f"Low : {fvg_low}")
-            lines.append(f"High : {fvg_high}\n")
-            lines.append("⏳ Pullback\n")
-            lines.append(f"Touch : {'Yes' if touched_bos else 'No'}\n")
-            lines.append(f"Candles since BOS : {candles_since_bos} / {PULLBACK_MAX_CANDLES}")
+            # ---------------------------------
+            # BUY / SELL diagnostic display
+            # ---------------------------------
+            for side in ["BUY", "SELL"]:
+                lines.append(f"\n{side}")
 
-        elif stage == "waiting_candle":
-            direction = state.get("direction", "?")
-            swing_level = state.get("swing_level", 0.0)
-            bos_level = state.get("bos_level", 0.0)
-            ob_low = state.get("ob_low", 0.0)
-            ob_high = state.get("ob_high", 0.0)
-            fvg_low = state.get("fvg_low", 0.0)
-            fvg_high = state.get("fvg_high", 0.0)
-            candles_since_bos = state.get("candles_since_bos", 0)
+                score = 0
 
-            lines.append(f"{direction}\n")
-            lines.append("✅ Liquidity Sweep : Found")
-            lines.append(f"Level : {swing_level}\n")
-            lines.append("✅ BOS : Found")
-            lines.append(f"Level : {bos_level}\n")
-            lines.append("✅ Order Block")
-            lines.append(f"Low : {ob_low}")
-            lines.append(f"High : {ob_high}\n")
-            lines.append("✅ Fair Value Gap")
-            lines.append(f"Low : {fvg_low}")
-            lines.append(f"High : {fvg_high}\n")
-            lines.append("✅ Pullback\n")
-            lines.append("⏳ Confirmation Candle\n")
-            lines.append(f"Attempts : {candles_since_bos} / {PULLBACK_MAX_CANDLES + RECENT_CHECK_CANDLES}")
+                if direction == side:
+                    current_stage = stage
+
+                    # Sweep
+                    if current_stage in [
+                        "waiting_bos",
+                        "waiting_pullback",
+                        "waiting_candle"
+                    ]:
+                        swing_level = state.get("swing_level", 0.0)
+                        lines.append(
+                            f"✅ Sweep: Found ({swing_level})"
+                        )
+                        score += 1
+                    else:
+                        lines.append("❌ Sweep: Not found")
+
+                    # BOS
+                    if current_stage in [
+                        "waiting_pullback",
+                        "waiting_candle"
+                    ]:
+                        bos_level = state.get("bos_level", 0.0)
+                        lines.append(
+                            f"✅ BOS: Confirmed ({bos_level})"
+                        )
+                        score += 1
+                    elif current_stage == "waiting_bos":
+                        candles = state.get(
+                            "candles_since_sweep",
+                            0
+                        )
+                        lines.append(
+                            f"⏳ BOS: Waiting "
+                            f"({candles}/{BOS_MAX_CANDLES})"
+                        )
+                    else:
+                        lines.append("❌ BOS: Waiting")
+
+                    # OB / FVG
+                    if current_stage in [
+                        "waiting_pullback",
+                        "waiting_candle"
+                    ]:
+                        ob_low = state.get("ob_low", 0.0)
+                        ob_high = state.get("ob_high", 0.0)
+                        fvg_low = state.get("fvg_low", 0.0)
+                        fvg_high = state.get("fvg_high", 0.0)
+
+                        lines.append(
+                            f"✅ OB: {ob_low} → {ob_high}"
+                        )
+                        lines.append(
+                            f"✅ FVG: {fvg_low} → {fvg_high}"
+                        )
+                        score += 1
+                    elif current_stage == "waiting_bos":
+                        lines.append(
+                            "⏳ OB/FVG: Waiting for formation"
+                        )
+                    else:
+                        lines.append(
+                            "❌ OB/FVG: Not formed"
+                        )
+
+                    # Pullback
+                    if current_stage == "waiting_candle":
+                        touched = state.get(
+                            "touched_bos",
+                            False
+                        )
+                        lines.append(
+                            "✅ Pullback: Confirmed"
+                            if touched
+                            else "⏳ Pullback: Waiting"
+                        )
+                        if touched:
+                            score += 1
+                    elif current_stage == "waiting_pullback":
+                        touched = state.get(
+                            "touched_bos",
+                            False
+                        )
+                        candles = state.get(
+                            "candles_since_bos",
+                            0
+                        )
+
+                        if touched:
+                            lines.append(
+                                "✅ Pullback: Touched"
+                            )
+                            score += 1
+                        else:
+                            lines.append(
+                                "⏳ Pullback: Waiting"
+                            )
+
+                        lines.append(
+                            f"   Candles: "
+                            f"{candles}/{PULLBACK_MAX_CANDLES}"
+                        )
+                    else:
+                        lines.append(
+                            "❌ Pullback: Waiting"
+                        )
+
+                    # Candle confirmation
+                    if current_stage == "waiting_candle":
+                        candles = state.get(
+                            "candles_since_bos",
+                            0
+                        )
+
+                        lines.append(
+                            "⏳ Candle Conf: Waiting"
+                        )
+                        lines.append(
+                            f"   Attempts: "
+                            f"{candles}/"
+                            f"{PULLBACK_MAX_CANDLES + RECENT_CHECK_CANDLES}"
+                        )
+                    else:
+                        lines.append(
+                            "❌ Candle Conf: Waiting"
+                        )
+
+                else:
+                    lines.append("❌ Sweep: Not found")
+                    lines.append("❌ BOS: Waiting")
+                    lines.append("❌ OB/FVG: Not formed")
+                    lines.append("❌ Pullback: Waiting")
+                    lines.append("❌ Candle Conf: Waiting")
+
+                lines.append(f"Score: {score}/5")
+
+    # =========================
+    # 1H TREND CONTEXT
+    # =========================
+    lines.append("\n━━━━━━━━━━━━━━━━")
+    lines.append("1H (Trend Context)")
+    lines.append("━━━━━━━━━━━━━━━━")
+
+    result_1h = get_cached_data(pair, "1h") or get_price_data(pair, "1h")
+
+    if result_1h:
+        closes, highs, lows, opens = result_1h
+        ema200 = calc_ema(closes, 200)
+        trend = get_trend_structure(closes)
+        current_price = closes[-1]
+
+        if ema200 is not None:
+            lines.append("\nBUY")
+
+            if current_price > ema200:
+                lines.append(
+                    f"✅ EMA200: Price ({current_price}) > "
+                    f"EMA ({ema200})"
+                )
+            else:
+                lines.append(
+                    f"❌ EMA200: Price ({current_price}) < "
+                    f"EMA ({ema200})"
+                )
+
+            if trend == "UP":
+                lines.append(
+                    "✅ Trend Structure: UP (Higher Highs)"
+                )
+            else:
+                lines.append(
+                    f"❌ Trend Structure: {trend}"
+                )
+
+            lines.append("\nSELL")
+
+            if current_price < ema200:
+                lines.append(
+                    f"✅ EMA200: Price ({current_price}) < "
+                    f"EMA ({ema200})"
+                )
+            else:
+                lines.append(
+                    f"❌ EMA200: Price ({current_price}) > "
+                    f"EMA ({ema200})"
+                )
+
+            if trend == "DOWN":
+                lines.append(
+                    "✅ Trend Structure: DOWN (Lower Lows)"
+                )
+            else:
+                lines.append(
+                    f"❌ Trend Structure: {trend}"
+                )
+
+    # =========================
+    # 4H MAJOR TREND
+    # =========================
+    lines.append("\n━━━━━━━━━━━━━━━━")
+    lines.append("4H (Major Trend)")
+    lines.append("━━━━━━━━━━━━━━━━")
+
+    result_4h = get_cached_data(pair, "4h") or get_price_data(pair, "4h")
+
+    if result_4h:
+        closes, highs, lows, opens = result_4h
+        ema200 = calc_ema(closes, 200)
+        trend = get_trend_structure(closes)
+        current_price = closes[-1]
+
+        if ema200 is not None:
+            lines.append("\nBUY")
+
+            if current_price > ema200:
+                lines.append(
+                    f"✅ EMA200: Price ({current_price}) > EMA200"
+                )
+            else:
+                lines.append(
+                    f"❌ EMA200: Price ({current_price}) < EMA200"
+                )
+
+            if trend == "UP":
+                lines.append(
+                    "✅ Trend Structure: UP"
+                )
+            else:
+                lines.append(
+                    f"❌ Trend Structure: {trend}"
+                )
+
+            lines.append("\nSELL")
+
+            if current_price < ema200:
+                lines.append(
+                    f"✅ EMA200: Price ({current_price}) < EMA200"
+                )
+            else:
+                lines.append(
+                    f"❌ EMA200: Price ({current_price}) > EMA200"
+                )
+
+            if trend == "DOWN":
+                lines.append(
+                    "✅ Trend Structure: DOWN"
+                )
+            else:
+                lines.append(
+                    f"❌ Trend Structure: {trend}"
+                )
 
     return "\n".join(lines)
     
