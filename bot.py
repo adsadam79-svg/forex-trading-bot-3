@@ -24,6 +24,7 @@ PAIR_CURRENCIES = {
 }
 
 SWING_LOOKBACK = 3          # 3 شمعات يمين + 3 يسار لتحديد القمم والقيعان بدقة
+MAJOR_SWING_LOOKBACK = 5    # لفريمات 1H/4H فقط: عمق أكبر لتحديد Major Swings الرئيسية وتفادي ضجيج السعر (Noise) عند بناء HTF Bias
 PULLBACK_MAX_CANDLES = 6    # حد أقصى للشموع لانتظار الـ Pullback
 BOS_MAX_CANDLES = 10        # حد أقصى للشموع لانتظار BOS بعد الـ Sweep
 SWEEP_ATR_MULTIPLIER = 0.15
@@ -544,27 +545,93 @@ def analyze_timeframe(pair, interval):
 
     return None
 
+def get_major_swing_points(highs, lows, lookback=MAJOR_SWING_LOOKBACK):
+    """Major Swing Highs/Lows بعمق أكبر من swings فريم الدخول (15min) لتفادي ضجيج السعر (Noise) —
+    تُستخدم حصرياً لبناء الـ HTF Market Structure (CHoCH/BOS) على 1H و4H"""
+    swings = []
+    n = len(highs)
+    for i in range(lookback, n - lookback):
+        window_highs = highs[i - lookback: i + lookback + 1]
+        window_lows = lows[i - lookback: i + lookback + 1]
+
+        if highs[i] == max(window_highs) and window_highs.count(highs[i]) == 1:
+            swings.append((i, highs[i], "high"))
+
+        if lows[i] == min(window_lows) and window_lows.count(lows[i]) == 1:
+            swings.append((i, lows[i], "low"))
+
+    swings.sort(key=lambda s: s[0])
+    return swings
+
+def get_smc_htf_bias(highs, lows, closes):
+    """يحدد الـ HTF Bias بمنطق SMC حقيقي على Major Swing Structure فقط:
+    كسر آخر Major Swing المعاكس = CHoCH (تحذير مبكر فقط، لا يغيّر الـ Bias بعد)
+    كسر تأكيدي إضافي في نفس اتجاه الـ CHoCH = BOS → عندها فقط يتم اعتماد الـ Bias الجديد"""
+    swings = get_major_swing_points(highs, lows)
+    if len(swings) < 2:
+        return None
+
+    trend = None            # الاتجاه الهيكلي المؤكد حالياً على الـ HTF: "UP" / "DOWN"
+    structure_high = None   # آخر Major Swing High مرجعي لكسر الـ CHoCH/BOS الصاعد
+    structure_low = None    # آخر Major Swing Low مرجعي لكسر الـ CHoCH/BOS الهابط
+    choch_direction = None  # CHoCH معلّق بانتظار BOS تأكيدي
+    bias = None
+
+    for i, level, kind in swings:
+        close_at_i = closes[i]
+
+        if kind == "high":
+            if structure_high is None:
+                structure_high = level
+                continue
+
+            if close_at_i > structure_high and trend != "UP":
+                if trend is None:
+                    # أول اتجاه هيكلي مبدئي (لا يحتاج CHoCH لأنه ما كاين حتى اتجاه سابق يتكسر)
+                    trend = "UP"
+                    bias = "BUY"
+                    choch_direction = None
+                elif choch_direction == "UP":
+                    # BOS: كسر تأكيدي بعد CHoCH صاعد سابق → اعتماد الـ Bias الجديد
+                    trend = "UP"
+                    bias = "BUY"
+                    choch_direction = None
+                else:
+                    # CHoCH: أول كسر لآخر Major Swing High أثناء اتجاه هابط = تحذير مبكر فقط
+                    choch_direction = "UP"
+
+            structure_high = max(structure_high, level)
+
+        else:  # kind == "low"
+            if structure_low is None:
+                structure_low = level
+                continue
+
+            if close_at_i < structure_low and trend != "DOWN":
+                if trend is None:
+                    trend = "DOWN"
+                    bias = "SELL"
+                    choch_direction = None
+                elif choch_direction == "DOWN":
+                    # BOS: كسر تأكيدي بعد CHoCH هابط سابق → اعتماد الـ Bias الجديد
+                    trend = "DOWN"
+                    bias = "SELL"
+                    choch_direction = None
+                else:
+                    # CHoCH: أول كسر لآخر Major Swing Low أثناء اتجاه صاعد = تحذير مبكر فقط
+                    choch_direction = "DOWN"
+
+            structure_low = min(structure_low, level)
+
+    return bias
+
 def get_timeframe_bias(pair, interval):
-    """تحليل سريع لتحديد اتجاه السوق العام على الفريمات الكبيرة"""
+    """يحدد الـ HTF Bias على الفريمات الكبيرة (1H/4H) بمنطق SMC: Major Swings → CHoCH → BOS → Bias"""
     result = get_cached_data(pair, interval) or get_price_data(pair, interval)
     if not result:
         return None
     closes, highs, lows, opens = result
-    ema200 = calc_ema(closes, 200)
-    trend = get_trend_structure(closes)
-    current_price = closes[-1]
-
-    if ema200 is None or trend is None:
-        return None
-
-    is_bullish = current_price > ema200 and trend == "UP"
-    is_bearish = current_price < ema200 and trend == "DOWN"
-
-    if is_bullish:
-        return "BUY"
-    elif is_bearish:
-        return "SELL"
-    return "SIDEWAYS"
+    return get_smc_htf_bias(highs, lows, closes)
 
 def reset_pair_states(pair):
     for tf in TIMEFRAMES:
@@ -653,10 +720,10 @@ def analyze_pair(pair):
 
 def get_strength_label(strength):
     if strength == 3:
-        return "⭐⭐⭐ Gold (4H + 1H + 15m)"
+        return "⭐⭐⭐ Gold (15min + 1H + 4H Alignment)"
     elif strength == 2:
-        return "⭐⭐ Silver (1H + 15m)"
-    return "⭐ Bronze (15m only)"
+        return "⭐⭐ Silver (15min + HTF Alignment)"
+    return "⭐ Bronze (15min Setup)"
 
 def pull_from_github():
     if not GH_TOKEN or not GITHUB_REPO:
@@ -1252,4 +1319,3 @@ if __name__ == "__main__":
     server_thread.daemon = True
     server_thread.start()
     main_loop()
- 
