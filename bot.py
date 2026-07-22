@@ -587,20 +587,21 @@ def get_smc_htf_bias(highs, lows, closes):
 
             if close_at_i > structure_high and trend != "UP":
                 if trend is None:
-                    # أول اتجاه هيكلي مبدئي (لا يحتاج CHoCH لأنه ما كاين حتى اتجاه سابق يتكسر)
+                    # أول اتجاه هيكلي مبدئي — يُعتمد مباشرة كأول مرجع هيكلي
                     trend = "UP"
                     bias = "BUY"
                     choch_direction = None
+                    structure_high = level
                 elif choch_direction == "UP":
-                    # BOS: كسر تأكيدي بعد CHoCH صاعد سابق → اعتماد الـ Bias الجديد
+                    # BOS مؤكد بعد CHoCH صاعد سابق → يحدّث المرجع الهيكلي ويعتمد الـ Bias الجديد فقط الآن
                     trend = "UP"
                     bias = "BUY"
                     choch_direction = None
+                    structure_high = level
                 else:
-                    # CHoCH: أول كسر لآخر Major Swing High أثناء اتجاه هابط = تحذير مبكر فقط
+                    # CHoCH: إنذار مبكر فقط — المرجع الهيكلي يبقى ثابتاً بلا أي تحديث
                     choch_direction = "UP"
-
-            structure_high = max(structure_high, level)
+            # أي Major Swing High آخر (استمرار عادي بلا كسر) لا يحدّث المرجع الهيكلي إطلاقاً
 
         else:  # kind == "low"
             if structure_low is None:
@@ -612,16 +613,17 @@ def get_smc_htf_bias(highs, lows, closes):
                     trend = "DOWN"
                     bias = "SELL"
                     choch_direction = None
+                    structure_low = level
                 elif choch_direction == "DOWN":
-                    # BOS: كسر تأكيدي بعد CHoCH هابط سابق → اعتماد الـ Bias الجديد
+                    # BOS مؤكد بعد CHoCH هابط سابق → يحدّث المرجع الهيكلي ويعتمد الـ Bias الجديد فقط الآن
                     trend = "DOWN"
                     bias = "SELL"
                     choch_direction = None
+                    structure_low = level
                 else:
-                    # CHoCH: أول كسر لآخر Major Swing Low أثناء اتجاه صاعد = تحذير مبكر فقط
+                    # CHoCH: إنذار مبكر فقط — المرجع الهيكلي يبقى ثابتاً بلا أي تحديث
                     choch_direction = "DOWN"
-
-            structure_low = min(structure_low, level)
+            # أي Major Swing Low آخر (استمرار عادي بلا كسر) لا يحدّث المرجع الهيكلي إطلاقاً
 
     return bias
 
@@ -632,6 +634,91 @@ def get_timeframe_bias(pair, interval):
         return None
     closes, highs, lows, opens = result
     return get_smc_htf_bias(highs, lows, closes)
+
+def get_htf_structure_debug(highs, lows, closes):
+    """Read-only: نفس منطق get_smc_htf_bias بالضبط، لكن كترجع خط تشخيصي (Major Swings/CHoCH/BOS/Bias)
+    للاستخدام فـ get_debug_report فقط. ما كتبدلش أي state ولا كتأثر على منطق الدخول."""
+    swings = get_major_swing_points(highs, lows)
+    if len(swings) < 2:
+        return "⏳ Not enough Major Swings yet"
+
+    trend = None
+    structure_high = None
+    structure_low = None
+    choch_direction = None
+    bias = None
+    choch_events = []
+    bos_events = []
+
+    for i, level, kind in swings:
+        close_at_i = closes[i]
+
+        if kind == "high":
+            if structure_high is None:
+                structure_high = level
+                continue
+
+            if close_at_i > structure_high and trend != "UP":
+                if trend is None:
+                    trend = "UP"
+                    bias = "BUY"
+                    choch_direction = None
+                elif choch_direction == "UP":
+                    bos_events.append(("BUY", level))
+                    trend = "UP"
+                    bias = "BUY"
+                    choch_direction = None
+                else:
+                    choch_direction = "UP"
+                    choch_events.append(("UP", level))
+
+            structure_high = level
+
+        else:
+            if structure_low is None:
+                structure_low = level
+                continue
+
+            if close_at_i < structure_low and trend != "DOWN":
+                if trend is None:
+                    trend = "DOWN"
+                    bias = "SELL"
+                    choch_direction = None
+                elif choch_direction == "DOWN":
+                    bos_events.append(("SELL", level))
+                    trend = "DOWN"
+                    bias = "SELL"
+                    choch_direction = None
+                else:
+                    choch_direction = "DOWN"
+                    choch_events.append(("DOWN", level))
+
+            structure_low = level
+
+    lines = [f"📌 Major Swings: {len(swings)}"]
+
+    last_choch = choch_events[-1] if choch_events else None
+    last_bos = bos_events[-1] if bos_events else None
+
+    if last_choch:
+        lines.append(f"⚠️ CHoCH: {last_choch[0]} ({last_choch[1]})")
+    else:
+        lines.append("❌ CHoCH: None")
+
+    if last_bos:
+        lines.append(f"✅ BOS: {last_bos[0]} ({last_bos[1]})")
+    else:
+        lines.append("❌ BOS: None")
+
+    if choch_direction:
+        lines.append(f"⏳ Pending CHoCH awaiting BOS: {choch_direction}")
+
+    if bias:
+        lines.append(f"🎯 HTF Bias: {bias}")
+    else:
+        lines.append("🎯 HTF Bias: None")
+
+    return "\n".join(lines)
 
 def reset_pair_states(pair):
     for tf in TIMEFRAMES:
@@ -1034,120 +1121,30 @@ def get_debug_report(pair):
                 lines.append(f"Score: {score}/5")
 
     # =========================
-    # 1H TREND CONTEXT
+    # 1H SMC STRUCTURE (Major Swings → CHoCH → BOS → Bias)
     # =========================
     lines.append("\n━━━━━━━━━━━━━━━━")
-    lines.append("1H (Trend Context)")
+    lines.append("1H (SMC Structure)")
     lines.append("━━━━━━━━━━━━━━━━")
 
     result_1h = get_cached_data(pair, "1h") or get_price_data(pair, "1h")
 
     if result_1h:
         closes, highs, lows, opens = result_1h
-        ema200 = calc_ema(closes, 200)
-        trend = get_trend_structure(closes)
-        current_price = closes[-1]
-
-        if ema200 is not None:
-            lines.append("\nBUY")
-
-            if current_price > ema200:
-                lines.append(
-                    f"✅ EMA200: Price ({current_price}) > "
-                    f"EMA ({ema200})"
-                )
-            else:
-                lines.append(
-                    f"❌ EMA200: Price ({current_price}) < "
-                    f"EMA ({ema200})"
-                )
-
-            if trend == "UP":
-                lines.append(
-                    "✅ Trend Structure: UP (Higher Highs)"
-                )
-            else:
-                lines.append(
-                    f"❌ Trend Structure: {trend}"
-                )
-
-            lines.append("\nSELL")
-
-            if current_price < ema200:
-                lines.append(
-                    f"✅ EMA200: Price ({current_price}) < "
-                    f"EMA ({ema200})"
-                )
-            else:
-                lines.append(
-                    f"❌ EMA200: Price ({current_price}) > "
-                    f"EMA ({ema200})"
-                )
-
-            if trend == "DOWN":
-                lines.append(
-                    "✅ Trend Structure: DOWN (Lower Lows)"
-                )
-            else:
-                lines.append(
-                    f"❌ Trend Structure: {trend}"
-                )
+        lines.append(get_htf_structure_debug(highs, lows, closes))
 
     # =========================
-    # 4H MAJOR TREND
+    # 4H SMC STRUCTURE (Major Swings → CHoCH → BOS → Bias)
     # =========================
     lines.append("\n━━━━━━━━━━━━━━━━")
-    lines.append("4H (Major Trend)")
+    lines.append("4H (SMC Structure)")
     lines.append("━━━━━━━━━━━━━━━━")
 
     result_4h = get_cached_data(pair, "4h") or get_price_data(pair, "4h")
 
     if result_4h:
         closes, highs, lows, opens = result_4h
-        ema200 = calc_ema(closes, 200)
-        trend = get_trend_structure(closes)
-        current_price = closes[-1]
-
-        if ema200 is not None:
-            lines.append("\nBUY")
-
-            if current_price > ema200:
-                lines.append(
-                    f"✅ EMA200: Price ({current_price}) > EMA200"
-                )
-            else:
-                lines.append(
-                    f"❌ EMA200: Price ({current_price}) < EMA200"
-                )
-
-            if trend == "UP":
-                lines.append(
-                    "✅ Trend Structure: UP"
-                )
-            else:
-                lines.append(
-                    f"❌ Trend Structure: {trend}"
-                )
-
-            lines.append("\nSELL")
-
-            if current_price < ema200:
-                lines.append(
-                    f"✅ EMA200: Price ({current_price}) < EMA200"
-                )
-            else:
-                lines.append(
-                    f"❌ EMA200: Price ({current_price}) > EMA200"
-                )
-
-            if trend == "DOWN":
-                lines.append(
-                    "✅ Trend Structure: DOWN"
-                )
-            else:
-                lines.append(
-                    f"❌ Trend Structure: {trend}"
-                )
+        lines.append(get_htf_structure_debug(highs, lows, closes))
 
     return "\n".join(lines)
     
