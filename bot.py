@@ -663,16 +663,17 @@ def get_htf_structure_debug(highs, lows, closes):
                     trend = "UP"
                     bias = "BUY"
                     choch_direction = None
+                    structure_high = level
                 elif choch_direction == "UP":
                     bos_events.append(("BUY", level))
                     trend = "UP"
                     bias = "BUY"
                     choch_direction = None
+                    structure_high = level
                 else:
                     choch_direction = "UP"
                     choch_events.append(("UP", level))
-
-            structure_high = level
+            # أي Major Swing High آخر (استمرار عادي بلا كسر) لا يحدّث المرجع الهيكلي إطلاقاً
 
         else:
             if structure_low is None:
@@ -684,16 +685,17 @@ def get_htf_structure_debug(highs, lows, closes):
                     trend = "DOWN"
                     bias = "SELL"
                     choch_direction = None
+                    structure_low = level
                 elif choch_direction == "DOWN":
                     bos_events.append(("SELL", level))
                     trend = "DOWN"
                     bias = "SELL"
                     choch_direction = None
+                    structure_low = level
                 else:
                     choch_direction = "DOWN"
                     choch_events.append(("DOWN", level))
-
-            structure_low = level
+            # أي Major Swing Low آخر (استمرار عادي بلا كسر) لا يحدّث المرجع الهيكلي إطلاقاً
 
     lines = [f"📌 Major Swings: {len(swings)}"]
 
