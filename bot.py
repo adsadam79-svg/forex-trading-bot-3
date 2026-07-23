@@ -566,7 +566,9 @@ def get_major_swing_points(highs, lows, lookback=MAJOR_SWING_LOOKBACK):
 def get_smc_htf_bias(highs, lows, closes):
     """يحدد الـ HTF Bias بمنطق SMC حقيقي على Major Swing Structure فقط:
     كسر آخر Major Swing المعاكس = CHoCH (تحذير مبكر فقط، لا يغيّر الـ Bias بعد)
-    كسر تأكيدي إضافي في نفس اتجاه الـ CHoCH = BOS → عندها فقط يتم اعتماد الـ Bias الجديد"""
+    كسر تأكيدي إضافي في نفس اتجاه الـ CHoCH = BOS → عندها فقط يتم اعتماد الـ Bias الجديد
+    التأكيد (CHoCH/BOS) يتم بشمعة لاحقة حقيقية (Subsequent Candle) وليس بنفس شمعة الـ Swing،
+    بنفس منطق التأكيد المستعمل فـ 15min."""
     swings = get_major_swing_points(highs, lows)
     if len(swings) < 2:
         return None
@@ -577,30 +579,46 @@ def get_smc_htf_bias(highs, lows, closes):
     choch_direction = None  # CHoCH معلّق بانتظار BOS تأكيدي
     bias = None
 
-    for i, level, kind in swings:
-        close_at_i = closes[i]
+    n = len(closes)
+
+    for idx in range(len(swings)):
+        i, level, kind = swings[idx]
+
+        # نحدد نافذة البحث عن شمعة لاحقة تأكد الكسر: من الشمعة اللي بعد الـ Swing
+        # حتى الشمعة اللي قبل الـ Swing التالي (أو نهاية البيانات إلا كان آخر Swing)
+        next_swing_index = swings[idx + 1][0] if idx + 1 < len(swings) else n
+        confirm_start = i + 1
+        confirm_end = min(next_swing_index, n)
 
         if kind == "high":
             if structure_high is None:
                 structure_high = level
                 continue
 
-            if close_at_i > structure_high and trend != "UP":
-                if trend is None:
-                    # أول اتجاه هيكلي مبدئي — يُعتمد مباشرة كأول مرجع هيكلي
-                    trend = "UP"
-                    bias = "BUY"
-                    choch_direction = None
-                    structure_high = level
-                elif choch_direction == "UP":
-                    # BOS مؤكد بعد CHoCH صاعد سابق → يحدّث المرجع الهيكلي ويعتمد الـ Bias الجديد فقط الآن
-                    trend = "UP"
-                    bias = "BUY"
-                    choch_direction = None
-                    structure_high = level
-                else:
-                    # CHoCH: إنذار مبكر فقط — المرجع الهيكلي يبقى ثابتاً بلا أي تحديث
-                    choch_direction = "UP"
+            if trend != "UP":
+                confirmed = False
+                for j in range(confirm_start, confirm_end):
+                    close_at_j = closes[j]
+                    if close_at_j > structure_high:
+                        confirmed = True
+                        break
+
+                if confirmed:
+                    if trend is None:
+                        # أول اتجاه هيكلي مبدئي — يُعتمد مباشرة كأول مرجع هيكلي
+                        trend = "UP"
+                        bias = "BUY"
+                        choch_direction = None
+                        structure_high = level
+                    elif choch_direction == "UP":
+                        # BOS مؤكد بعد CHoCH صاعد سابق → يحدّث المرجع الهيكلي ويعتمد الـ Bias الجديد فقط الآن
+                        trend = "UP"
+                        bias = "BUY"
+                        choch_direction = None
+                        structure_high = level
+                    else:
+                        # CHoCH: إنذار مبكر فقط — المرجع الهيكلي يبقى ثابتاً بلا أي تحديث
+                        choch_direction = "UP"
             # أي Major Swing High آخر (استمرار عادي بلا كسر) لا يحدّث المرجع الهيكلي إطلاقاً
 
         else:  # kind == "low"
@@ -608,21 +626,29 @@ def get_smc_htf_bias(highs, lows, closes):
                 structure_low = level
                 continue
 
-            if close_at_i < structure_low and trend != "DOWN":
-                if trend is None:
-                    trend = "DOWN"
-                    bias = "SELL"
-                    choch_direction = None
-                    structure_low = level
-                elif choch_direction == "DOWN":
-                    # BOS مؤكد بعد CHoCH هابط سابق → يحدّث المرجع الهيكلي ويعتمد الـ Bias الجديد فقط الآن
-                    trend = "DOWN"
-                    bias = "SELL"
-                    choch_direction = None
-                    structure_low = level
-                else:
-                    # CHoCH: إنذار مبكر فقط — المرجع الهيكلي يبقى ثابتاً بلا أي تحديث
-                    choch_direction = "DOWN"
+            if trend != "DOWN":
+                confirmed = False
+                for j in range(confirm_start, confirm_end):
+                    close_at_j = closes[j]
+                    if close_at_j < structure_low:
+                        confirmed = True
+                        break
+
+                if confirmed:
+                    if trend is None:
+                        trend = "DOWN"
+                        bias = "SELL"
+                        choch_direction = None
+                        structure_low = level
+                    elif choch_direction == "DOWN":
+                        # BOS مؤكد بعد CHoCH هابط سابق → يحدّث المرجع الهيكلي ويعتمد الـ Bias الجديد فقط الآن
+                        trend = "DOWN"
+                        bias = "SELL"
+                        choch_direction = None
+                        structure_low = level
+                    else:
+                        # CHoCH: إنذار مبكر فقط — المرجع الهيكلي يبقى ثابتاً بلا أي تحديث
+                        choch_direction = "DOWN"
             # أي Major Swing Low آخر (استمرار عادي بلا كسر) لا يحدّث المرجع الهيكلي إطلاقاً
 
     return bias
