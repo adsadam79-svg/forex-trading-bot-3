@@ -662,7 +662,7 @@ def get_timeframe_bias(pair, interval):
     return get_smc_htf_bias(highs, lows, closes)
 
 def get_htf_structure_debug(highs, lows, closes):
-    """Read-only: نفس منطق get_smc_htf_bias بالضبط، لكن كترجع خط تشخيصي (Major Swings/CHoCH/BOS/Bias)
+    """Read-only: نفس منطق get_smc_htf_bias بالضبط، لكن كترجع تقرير تشخيصي منظم BUY/SELL
     للاستخدام فـ get_debug_report فقط. ما كتبدلش أي state ولا كتأثر على منطق الدخول."""
     swings = get_major_swing_points(highs, lows)
     if len(swings) < 2:
@@ -676,78 +676,87 @@ def get_htf_structure_debug(highs, lows, closes):
     choch_events = []
     bos_events = []
 
-    for i, level, kind in swings:
-        close_at_i = closes[i]
+    n = len(closes)
+
+    for idx in range(len(swings)):
+        i, level, kind = swings[idx]
+        next_swing_index = swings[idx + 1][0] if idx + 1 < len(swings) else n
+        confirm_start = i + 1
+        confirm_end = min(next_swing_index, n)
 
         if kind == "high":
             if structure_high is None:
                 structure_high = level
                 continue
 
-            if close_at_i > structure_high and trend != "UP":
-                if trend is None:
-                    trend = "UP"
-                    bias = "BUY"
-                    choch_direction = None
-                    structure_high = level
-                elif choch_direction == "UP":
-                    bos_events.append(("BUY", level))
-                    trend = "UP"
-                    bias = "BUY"
-                    choch_direction = None
-                    structure_high = level
-                else:
-                    choch_direction = "UP"
-                    choch_events.append(("UP", level))
-            # أي Major Swing High آخر (استمرار عادي بلا كسر) لا يحدّث المرجع الهيكلي إطلاقاً
+            if trend != "UP":
+                confirmed = any(closes[j] > structure_high for j in range(confirm_start, confirm_end))
+                if confirmed:
+                    if trend is None:
+                        trend = "UP"
+                        bias = "BUY"
+                        choch_direction = None
+                        structure_high = level
+                    elif choch_direction == "UP":
+                        bos_events.append(("BUY", level))
+                        trend = "UP"
+                        bias = "BUY"
+                        choch_direction = None
+                        structure_high = level
+                    else:
+                        choch_direction = "UP"
+                        choch_events.append(("UP", level))
 
         else:
             if structure_low is None:
                 structure_low = level
                 continue
 
-            if close_at_i < structure_low and trend != "DOWN":
-                if trend is None:
-                    trend = "DOWN"
-                    bias = "SELL"
-                    choch_direction = None
-                    structure_low = level
-                elif choch_direction == "DOWN":
-                    bos_events.append(("SELL", level))
-                    trend = "DOWN"
-                    bias = "SELL"
-                    choch_direction = None
-                    structure_low = level
-                else:
-                    choch_direction = "DOWN"
-                    choch_events.append(("DOWN", level))
-            # أي Major Swing Low آخر (استمرار عادي بلا كسر) لا يحدّث المرجع الهيكلي إطلاقاً
+            if trend != "DOWN":
+                confirmed = any(closes[j] < structure_low for j in range(confirm_start, confirm_end))
+                if confirmed:
+                    if trend is None:
+                        trend = "DOWN"
+                        bias = "SELL"
+                        choch_direction = None
+                        structure_low = level
+                    elif choch_direction == "DOWN":
+                        bos_events.append(("SELL", level))
+                        trend = "DOWN"
+                        bias = "SELL"
+                        choch_direction = None
+                        structure_low = level
+                    else:
+                        choch_direction = "DOWN"
+                        choch_events.append(("DOWN", level))
+
+    last_choch_up = next((e for e in reversed(choch_events) if e[0] == "UP"), None)
+    last_choch_down = next((e for e in reversed(choch_events) if e[0] == "DOWN"), None)
+    last_bos_buy = next((e for e in reversed(bos_events) if e[0] == "BUY"), None)
+    last_bos_sell = next((e for e in reversed(bos_events) if e[0] == "SELL"), None)
 
     lines = [f"📌 Major Swings: {len(swings)}"]
 
-    last_choch = choch_events[-1] if choch_events else None
-    last_bos = bos_events[-1] if bos_events else None
-
-    if last_choch:
-        lines.append(f"⚠️ CHoCH: {last_choch[0]} ({last_choch[1]})")
+    # ---------------- BUY ----------------
+    lines.append("\nBUY")
+    lines.append(f"⚠️ CHoCH: {'UP (' + str(last_choch_up[1]) + ')' if last_choch_up else 'None'}")
+    lines.append(f"✅ BOS: {'BUY (' + str(last_bos_buy[1]) + ')' if last_bos_buy else 'None'}")
+    if bias == "BUY":
+        lines.append("🎯 HTF Bias: BUY ✅")
     else:
-        lines.append("❌ CHoCH: None")
+        lines.append("🎯 HTF Bias: Not Active")
 
-    if last_bos:
-        lines.append(f"✅ BOS: {last_bos[0]} ({last_bos[1]})")
+    # ---------------- SELL ----------------
+    lines.append("\nSELL")
+    lines.append(f"⚠️ CHoCH: {'DOWN (' + str(last_choch_down[1]) + ')' if last_choch_down else 'None'}")
+    lines.append(f"✅ BOS: {'SELL (' + str(last_bos_sell[1]) + ')' if last_bos_sell else 'None'}")
+    if bias == "SELL":
+        lines.append("🎯 HTF Bias: SELL ✅")
     else:
-        lines.append("❌ BOS: None")
-
-    if choch_direction:
-        lines.append(f"⏳ Pending CHoCH awaiting BOS: {choch_direction}")
-
-    if bias:
-        lines.append(f"🎯 HTF Bias: {bias}")
-    else:
-        lines.append("🎯 HTF Bias: None")
+        lines.append("🎯 HTF Bias: Not Active")
 
     return "\n".join(lines)
-
+    
 def reset_pair_states(pair):
     for tf in TIMEFRAMES:
         reset_state(f"{pair}_{tf}")
