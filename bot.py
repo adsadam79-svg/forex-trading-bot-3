@@ -520,10 +520,23 @@ def analyze_timeframe(pair, interval):
         sequence_state[state_key] = state
         return None
 
-    # ---------- المرحلة 4: تأكيد الشموع الإنعكاسية (Candlestick Confirmation) ----------
+   # ---------- المرحلة 4: تأكيد الشموع الإنعكاسية (Candlestick Confirmation) ----------
     if state["stage"] == "waiting_candle":
         direction = state["direction"]
         bos_level = state["bos_level"]
+        ob_low = state["ob_low"]
+        ob_high = state["ob_high"]
+
+        # إلغاء الـ Setup إلا كسر السعر الـ OB بالكامل بعد الوصول لهاد المرحلة
+        # (نفس التحقق اللي كاين فمرحلة waiting_pullback، مكمّل هنا لضمان استمرارية الحماية)
+        if direction == "BUY":
+            if current_close < ob_low:
+                reset_state(state_key)
+                return None
+        else:
+            if current_close > ob_high:
+                reset_state(state_key)
+                return None
 
         confirmed = check_candlestick_confirmation(opens, highs, lows, closes, direction)
         if confirmed:
@@ -542,8 +555,6 @@ def analyze_timeframe(pair, interval):
 
         sequence_state[state_key] = state
         return None
-
-    return None
 
 def get_major_swing_points(highs, lows, lookback=MAJOR_SWING_LOOKBACK):
     """Major Swing Highs/Lows بعمق أكبر من swings فريم الدخول (15min) لتفادي ضجيج السعر (Noise) —
