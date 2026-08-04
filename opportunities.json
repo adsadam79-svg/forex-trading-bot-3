@@ -814,5 +814,17 @@
     "rr": 1.5,
     "strength": 1,
     "cancelled": false
+  },
+  {
+    "date": "2026-08-04 09:40",
+    "time": "09:40 UTC",
+    "pair": "AUD/USD",
+    "direction": "BUY 📈",
+    "price": 0.70256,
+    "tp": 0.70306,
+    "sl": 0.70223,
+    "rr": 1.5,
+    "strength": 3,
+    "cancelled": false
   }
 ]
