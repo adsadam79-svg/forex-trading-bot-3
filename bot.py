@@ -337,6 +337,25 @@ def check_candlestick_confirmation(opens, highs, lows, closes, direction):
                 return True
     return False
 
+
+def identify_candlestick_pattern(opens, highs, lows, closes, direction):
+    """Read-only: يحدد اسم نموذج الشمعة اللي أكدت الدخول (للتسجيل فقط، لا تُستخدم فأي قرار).
+    نفس شرط check_candlestick_confirmation بالضبط، لكن كترجع الاسم بدل True/False."""
+    n = len(closes)
+    start = max(1, n - RECENT_CHECK_CANDLES)
+    for i in range(start, n):
+        if direction == "BUY":
+            if is_bullish_engulfing(opens, closes, i):
+                return "Bullish Engulfing"
+            if is_strong_bull_candle(opens, highs, lows, closes, i):
+                return "Strong Bullish Candle"
+        else:
+            if is_bearish_engulfing(opens, closes, i):
+                return "Bearish Engulfing"
+            if is_strong_bear_candle(opens, highs, lows, closes, i):
+                return "Strong Bearish Candle"
+    return None
+
 def reset_state(state_key):
     sequence_state[state_key] = {"stage": "waiting_sweep"}
 
@@ -541,11 +560,35 @@ def analyze_timeframe(pair, interval):
         confirmed = check_candlestick_confirmation(opens, highs, lows, closes, direction)
         if confirmed:
             reset_state(state_key)
+            # === معلومات إضافية للتسجيل فقط فـ opportunities.json — لا تؤثر على القرار أعلاه ===
+            fvg_low = state.get("fvg_low")
+            fvg_high = state.get("fvg_high")
+            pullback_boundary = max(ob_high, fvg_high) if direction == "BUY" else min(ob_low, fvg_low)
+            last_swing_high = get_last_swing(swings, "high")
+            last_swing_low = get_last_swing(swings, "low")
+            pattern_name = identify_candlestick_pattern(opens, highs, lows, closes, direction)
             return {
                 "direction": direction,
                 "atr": atr,
                 "price": current_price,
                 "bos_level": bos_level,
+                # الحقول الجديدة (Read-only, للتسجيل فقط):
+                "sweep_level": state.get("swing_level"),
+                "candles_since_sweep": state.get("candles_since_sweep"),
+                "candles_since_bos": state.get("candles_since_bos"),
+                "ob_low": ob_low,
+                "ob_high": ob_high,
+                "fvg_low": fvg_low,
+                "fvg_high": fvg_high,
+                "pullback_boundary": pullback_boundary,
+                "touched_ob_or_fvg": state.get("touched_bos"),
+                "last_swing_high": last_swing_high[1] if last_swing_high else None,
+                "last_swing_low": last_swing_low[1] if last_swing_low else None,
+                "candle_pattern": pattern_name,
+                "confirmation_open": opens[-1],
+                "confirmation_high": highs[-1],
+                "confirmation_low": lows[-1],
+                "confirmation_close": closes[-1],
             }
 
         state["candles_since_bos"] = state.get("candles_since_bos", 0) + 1
@@ -767,7 +810,71 @@ def get_htf_structure_debug(highs, lows, closes):
         lines.append("🎯 HTF Bias: Not Active")
 
     return "\n".join(lines)
-    
+
+
+def get_htf_diagnostic_info(highs, lows, closes):
+    """Read-only: نفس منطق get_smc_htf_bias بالضبط، لكن كترجع dict (bias/choch_seen/bos_seen/major_swing_high/low)
+    للتسجيل فقط فـ opportunities.json. لا تُستدعى من analyze_pair لاتخاذ أي قرار ولا تؤثر على أي state."""
+    swings = get_major_swing_points(highs, lows)
+    if len(swings) < 2:
+        return {"bias": None, "choch_seen": False, "bos_seen": False, "major_swing_high": None, "major_swing_low": None}
+
+    trend = None
+    structure_high = None
+    structure_low = None
+    choch_direction = None
+    bias = None
+    choch_seen = False
+    bos_seen = False
+    n = len(closes)
+
+    for idx in range(len(swings)):
+        i, level, kind = swings[idx]
+        next_swing_index = swings[idx + 1][0] if idx + 1 < len(swings) else n
+        confirm_start = i + 1
+        confirm_end = min(next_swing_index, n)
+
+        if kind == "high":
+            if structure_high is None:
+                structure_high = level
+                continue
+            if trend != "UP":
+                confirmed = any(closes[j] > structure_high for j in range(confirm_start, confirm_end))
+                if confirmed:
+                    if trend is None:
+                        trend = "UP"; bias = "BUY"; choch_direction = None; structure_high = level
+                    elif choch_direction == "UP":
+                        bos_seen = True
+                        trend = "UP"; bias = "BUY"; choch_direction = None; structure_high = level
+                    else:
+                        choch_direction = "UP"; choch_seen = True
+        else:
+            if structure_low is None:
+                structure_low = level
+                continue
+            if trend != "DOWN":
+                confirmed = any(closes[j] < structure_low for j in range(confirm_start, confirm_end))
+                if confirmed:
+                    if trend is None:
+                        trend = "DOWN"; bias = "SELL"; choch_direction = None; structure_low = level
+                    elif choch_direction == "DOWN":
+                        bos_seen = True
+                        trend = "DOWN"; bias = "SELL"; choch_direction = None; structure_low = level
+                    else:
+                        choch_direction = "DOWN"; choch_seen = True
+
+    last_high = get_last_swing(swings, "high")
+    last_low = get_last_swing(swings, "low")
+
+    return {
+        "bias": bias,
+        "choch_seen": choch_seen,
+        "bos_seen": bos_seen,
+        "major_swing_high": last_high[1] if last_high else None,
+        "major_swing_low": last_low[1] if last_low else None,
+    }
+
+
 def reset_pair_states(pair):
     for tf in TIMEFRAMES:
         reset_state(f"{pair}_{tf}")
@@ -841,6 +948,18 @@ def analyze_pair(pair):
 
     rr = round(tp_distance / sl_distance, 2)
 
+    # === معلومات إضافية للتسجيل فقط فـ opportunities.json — لا تؤثر على أي قرار أعلاه ===
+    result_1h = get_cached_data(pair, "1h")
+    result_4h = get_cached_data(pair, "4h")
+    h1_diag = {"bias": h1_bias, "choch_seen": False, "bos_seen": False, "major_swing_high": None, "major_swing_low": None}
+    h4_diag = {"bias": h4_bias, "choch_seen": False, "bos_seen": False, "major_swing_high": None, "major_swing_low": None}
+    if result_1h:
+        closes_1h, highs_1h, lows_1h, opens_1h = result_1h
+        h1_diag = get_htf_diagnostic_info(highs_1h, lows_1h, closes_1h)
+    if result_4h:
+        closes_4h, highs_4h, lows_4h, opens_4h = result_4h
+        h4_diag = get_htf_diagnostic_info(highs_4h, lows_4h, closes_4h)
+
     return {
         "pair": pair,
         "direction": "BUY 📈" if direction == "BUY" else "SELL 📉",
@@ -850,7 +969,10 @@ def analyze_pair(pair):
         "rr": rr,
         "strength": len(confirmed_tfs),
         "confirmed_tfs": confirmed_tfs,
-        "details": {"15min": m15_res}
+        "details": {"15min": m15_res},
+        # الحقول الجديدة (Read-only، للتسجيل فقط):
+        "h1_diag": h1_diag,
+        "h4_diag": h4_diag,
     }
 
 def get_strength_label(strength):
@@ -1278,6 +1400,10 @@ def main_loop():
 
                 danger_news, warning_news = get_high_impact_news(pair)
 
+                m15_details = trade["details"]["15min"]
+                h1_diag = trade.get("h1_diag", {})
+                h4_diag = trade.get("h4_diag", {})
+
                 op = {
                     "date": now.strftime("%Y-%m-%d %H:%M"),
                     "time": now_str,
@@ -1288,7 +1414,56 @@ def main_loop():
                     "sl": trade["sl"],
                     "rr": trade["rr"],
                     "strength": trade["strength"],
-                    "cancelled": bool(danger_news)
+                    "cancelled": bool(danger_news),
+                    # === معلومات إضافية للتحليل فقط — لا تؤثر على أي قرار فالبوت ===
+                    "timestamp": now.timestamp(),
+                    "market_info": {
+                        "atr": m15_details.get("atr"),
+                        "current_price": trade["price"],
+                    },
+                    "htf_info": {
+                        "h1_bias": h1_diag.get("bias"),
+                        "h1_choch_seen": h1_diag.get("choch_seen"),
+                        "h1_bos_seen": h1_diag.get("bos_seen"),
+                        "h1_major_swing_high": h1_diag.get("major_swing_high"),
+                        "h1_major_swing_low": h1_diag.get("major_swing_low"),
+                        "h4_bias": h4_diag.get("bias"),
+                        "h4_choch_seen": h4_diag.get("choch_seen"),
+                        "h4_bos_seen": h4_diag.get("bos_seen"),
+                        "h4_major_swing_high": h4_diag.get("major_swing_high"),
+                        "h4_major_swing_low": h4_diag.get("major_swing_low"),
+                    },
+                    "smc_info": {
+                        "sweep_level": m15_details.get("sweep_level"),
+                        "candles_since_sweep": m15_details.get("candles_since_sweep"),
+                        "bos_level": m15_details.get("bos_level"),
+                        "candles_since_bos": m15_details.get("candles_since_bos"),
+                        "ob_low": m15_details.get("ob_low"),
+                        "ob_high": m15_details.get("ob_high"),
+                        "fvg_low": m15_details.get("fvg_low"),
+                        "fvg_high": m15_details.get("fvg_high"),
+                    },
+                    "entry_info": {
+                        "entry_price": trade["price"],
+                        "tp": trade["tp"],
+                        "sl": trade["sl"],
+                        "rr": trade["rr"],
+                    },
+                    "pullback_info": {
+                        "pullback_boundary": m15_details.get("pullback_boundary"),
+                        "touched_ob_or_fvg": m15_details.get("touched_ob_or_fvg"),
+                    },
+                    "candle_confirmation_info": {
+                        "pattern": m15_details.get("candle_pattern"),
+                        "open": m15_details.get("confirmation_open"),
+                        "high": m15_details.get("confirmation_high"),
+                        "low": m15_details.get("confirmation_low"),
+                        "close": m15_details.get("confirmation_close"),
+                    },
+                    "swing_info": {
+                        "last_swing_high_15m": m15_details.get("last_swing_high"),
+                        "last_swing_low_15m": m15_details.get("last_swing_low"),
+                    },
                 }
                 opportunities.append(op)
                 push_to_github(opportunities)
