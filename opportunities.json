@@ -958,5 +958,65 @@
       "last_swing_high_15m": 0.7061,
       "last_swing_low_15m": 0.7056
     }
+  },
+  {
+    "date": "2026-08-12 15:16",
+    "time": "15:16 UTC",
+    "pair": "USD/JPY",
+    "direction": "BUY 📈",
+    "price": 159.20237,
+    "tp": 159.702,
+    "sl": 158.869,
+    "rr": 1.5,
+    "strength": 2,
+    "cancelled": false,
+    "timestamp": 1786547760.989235,
+    "market_info": {
+      "atr": 0.1308,
+      "current_price": 159.20237
+    },
+    "htf_info": {
+      "h1_bias": "BUY",
+      "h1_choch_seen": false,
+      "h1_bos_seen": false,
+      "h1_major_swing_high": 159.46446,
+      "h1_major_swing_low": 159.20298,
+      "h4_bias": "SELL",
+      "h4_choch_seen": true,
+      "h4_bos_seen": true,
+      "h4_major_swing_high": 158.57867,
+      "h4_major_swing_low": 157.55408
+    },
+    "smc_info": {
+      "sweep_level": 158.77493,
+      "candles_since_sweep": 5,
+      "bos_level": 159.19117,
+      "candles_since_bos": 0,
+      "ob_low": 159.05588,
+      "ob_high": 159.15186,
+      "fvg_low": 159.02129,
+      "fvg_high": 159.05588
+    },
+    "entry_info": {
+      "entry_price": 159.20237,
+      "tp": 159.702,
+      "sl": 158.869,
+      "rr": 1.5
+    },
+    "pullback_info": {
+      "pullback_boundary": 159.15186,
+      "touched_ob_or_fvg": true
+    },
+    "candle_confirmation_info": {
+      "pattern": "Bullish Engulfing",
+      "open": 159.22541,
+      "high": 159.25098,
+      "low": 159.19175,
+      "close": 159.20237
+    },
+    "swing_info": {
+      "last_swing_high_15m": 159.19117,
+      "last_swing_low_15m": 158.73433
+    }
   }
 ]
