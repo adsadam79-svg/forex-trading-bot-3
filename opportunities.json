@@ -1978,5 +1978,65 @@
       "last_swing_high_15m": 0.70275,
       "last_swing_low_15m": 0.70112
     }
+  },
+  {
+    "date": "2026-09-28 15:48",
+    "time": "15:48 UTC",
+    "pair": "AUD/USD",
+    "direction": "SELL 📉",
+    "price": 0.70173,
+    "tp": 0.70113,
+    "sl": 0.70213,
+    "rr": 1.5,
+    "strength": 3,
+    "cancelled": false,
+    "timestamp": 1790610527.444357,
+    "market_info": {
+      "atr": 0.000426,
+      "current_price": 0.70173
+    },
+    "htf_info": {
+      "h1_bias": "SELL",
+      "h1_choch_seen": false,
+      "h1_bos_seen": false,
+      "h1_major_swing_high": 0.7029,
+      "h1_major_swing_low": 0.7008,
+      "h4_bias": "SELL",
+      "h4_choch_seen": true,
+      "h4_bos_seen": true,
+      "h4_major_swing_high": 0.70401,
+      "h4_major_swing_low": 0.70042
+    },
+    "smc_info": {
+      "sweep_level": 0.70275,
+      "candles_since_sweep": 2,
+      "bos_level": 0.70188,
+      "candles_since_bos": 2,
+      "ob_low": 0.70235,
+      "ob_high": 0.7027,
+      "fvg_low": 0.70196,
+      "fvg_high": 0.70218
+    },
+    "entry_info": {
+      "entry_price": 0.70173,
+      "tp": 0.70113,
+      "sl": 0.70213,
+      "rr": 1.5
+    },
+    "pullback_info": {
+      "pullback_boundary": 0.70196,
+      "touched_ob_or_fvg": true
+    },
+    "candle_confirmation_info": {
+      "pattern": "Strong Bearish Candle",
+      "open": 0.7018,
+      "high": 0.7018,
+      "low": 0.70173,
+      "close": 0.70173
+    },
+    "swing_info": {
+      "last_swing_high_15m": 0.70283,
+      "last_swing_low_15m": 0.70113
+    }
   }
 ]
