@@ -2518,5 +2518,65 @@
       "last_swing_high_15m": 0.69845,
       "last_swing_low_15m": 0.69738
     }
+  },
+  {
+    "date": "2026-10-13 08:34",
+    "time": "08:34 UTC",
+    "pair": "USD/JPY",
+    "direction": "SELL 📉",
+    "price": 158.07589,
+    "tp": 157.576,
+    "sl": 158.409,
+    "rr": 1.5,
+    "strength": 1,
+    "cancelled": false,
+    "timestamp": 1791880440.235632,
+    "market_info": {
+      "atr": 0.075418,
+      "current_price": 158.07589
+    },
+    "htf_info": {
+      "h1_bias": "BUY",
+      "h1_choch_seen": false,
+      "h1_bos_seen": false,
+      "h1_major_swing_high": 158.75688,
+      "h1_major_swing_low": 158.07367,
+      "h4_bias": "BUY",
+      "h4_choch_seen": true,
+      "h4_bos_seen": true,
+      "h4_major_swing_high": 158.43708,
+      "h4_major_swing_low": 158.07367
+    },
+    "smc_info": {
+      "sweep_level": 158.35219,
+      "candles_since_sweep": 3,
+      "bos_level": 158.24237,
+      "candles_since_bos": 5,
+      "ob_low": 158.23809,
+      "ob_high": 158.33474,
+      "fvg_low": 158.27421,
+      "fvg_high": 158.29128
+    },
+    "entry_info": {
+      "entry_price": 158.07589,
+      "tp": 157.576,
+      "sl": 158.409,
+      "rr": 1.5
+    },
+    "pullback_info": {
+      "pullback_boundary": 158.23809,
+      "touched_ob_or_fvg": true
+    },
+    "candle_confirmation_info": {
+      "pattern": "Strong Bearish Candle",
+      "open": 158.15102,
+      "high": 158.15102,
+      "low": 158.0703,
+      "close": 158.07589
+    },
+    "swing_info": {
+      "last_swing_high_15m": 158.28923,
+      "last_swing_low_15m": 158.12056
+    }
   }
 ]
